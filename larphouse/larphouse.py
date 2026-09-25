@@ -22,7 +22,7 @@ DURATION = 5.0
 PAPER = np.array([238, 229, 211], np.float32) / 255
 INK = np.array([33, 27, 30], np.float32) / 255      # warm overprint dark, never pure black
 RED = np.array([150, 28, 38], np.float32) / 255
-SHEEN = np.array([150, 140, 128], np.float32) / 255
+CAT_EYE = np.array([240, 234, 222], np.float32) / 255
 
 # ---------------------------------------------------------------- timeline (seconds)
 T_LETTERS = (0.5, 2.9)       # glyphs bleed in, left to right
@@ -32,7 +32,11 @@ STAGGER = 0.13
 # don't grow in lockstep. Order: bottom right, bottom left, top right, top left.
 T_CORNERS = [(0.25, 4.0, 1.3), (0.6, 3.5, 1.7), (0.0, 3.7, 1.5), (0.45, 4.3, 1.9)]
 T_ROSE = (2.2, 3.8)
-T_GLEAM = (3.7, 4.55)
+# the cat: trots in from the right, sees the blooming rose, bristles, jumps, bolts back out
+T_CAT_IN = (1.0, 2.85)       # trot from off-screen right to its stopping mark
+T_CAT_BRISTLE = (3.0, 3.2)   # fur stands up
+T_CAT_JUMP = (3.2, 3.62)     # startle jump (the front-facing reference pose)
+T_CAT_RUN = (3.72, 4.3)      # dash off to the right
 
 
 def smooth(x):
@@ -299,10 +303,217 @@ def make_paper():
     return paper.astype(np.float32), np.clip(wear, 0.7, 1).astype(np.float32), grain
 
 
+# ---------------------------------------------------------------- the cat
+CAT_SCALE = 0.43
+CAT_GROUND = 1046            # feet line on the page
+CAT_STOP_X = 1480            # where it freezes (centre of the side-view sprite)
+
+
+def signed_distance(mask):
+    m = (mask > 0.5).astype(np.uint8)
+    return cv2.distanceTransform(m, cv2.DIST_L2, 5) - cv2.distanceTransform(1 - m, cv2.DIST_L2, 5)
+
+
+def fill_holes(mask):
+    m = (mask > 0.5).astype(np.uint8)
+    flood = m.copy()
+    cv2.floodFill(flood, np.zeros((m.shape[0] + 2, m.shape[1] + 2), np.uint8), (0, 0), 1)
+    return ((flood == 0) | (m > 0)).astype(np.float32)
+
+
+class Cat:
+    """Cut-out puppet built from the two cat references.
+
+    Side view (cat-scared.png): the silhouette is split into a body and four legs that swing
+    around their hips. A calm body is made by opening away the bristled fur; the scare morphs
+    the calm signed distance field into the original spiky one, so the fur visibly stands up.
+    Jump (cat-jump.png): the front-facing startled pose with its ground shadow.
+    """
+
+    def __init__(self):
+        s = CAT_SCALE
+        side = ink_from(os.path.join(REF, 'cat-scared.png'), lo=0.2, hi=0.7)
+        side = side[20:470, 60:580]                      # crop in reference pixels
+        oy, ox = 20, 60
+        sil = fill_holes(side)
+        eyes = np.clip(sil - (side > 0.5), 0, 1)
+        hip_y = 358 - oy                                 # belly line: the four legs separate below it
+        # legs: ink below the belly line, one component each
+        below = (side > 0.5).astype(np.uint8)
+        below[:hip_y] = 0
+        n, lab, st, _ = cv2.connectedComponentsWithStats(below, 8)
+        legs = []
+        for k in range(1, n):
+            x, y, w, h, area = st[k]
+            if area < 300:
+                continue
+            piece = np.zeros_like(sil)
+            x0, x1 = x - 3, x + w + 3
+            piece[hip_y - 12:hip_y, x0:x1] = sil[hip_y - 12:hip_y, x0:x1]
+            own = cv2.dilate((lab == k).astype(np.uint8), np.ones((5, 5), np.uint8)) > 0
+            piece[hip_y:] = sil[hip_y:] * own[hip_y:]      # only this leg's own ink below the belly
+            legs.append((piece, (x + w / 2, hip_y - 6)))
+        legs.sort(key=lambda p: p[1][0])
+        body_spiky = sil.copy()
+        body_spiky[hip_y:] = 0
+        # calm fur: open the back and tail, keep the head (ears, whiskers) as drawn
+        opened = cv2.morphologyEx((body_spiky > 0.5).astype(np.uint8), cv2.MORPH_OPEN,
+                                  cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (61, 61))).astype(np.float32)
+        opened = (cv2.GaussianBlur(opened, (0, 0), 6) > 0.5).astype(np.float32)
+        head = np.zeros_like(sil)
+        head[:, :170] = 1                                # reference x < 230
+        body_calm = np.maximum(opened, body_spiky * head)
+        # the tail's top tuft is thin; keep a smoothed stub of it so the calm cat still has a tail
+        tail = np.zeros_like(sil); tail[:250, 390:] = 1
+        tail_soft = cv2.morphologyEx((body_spiky * tail > 0.5).astype(np.uint8), cv2.MORPH_OPEN,
+                                     cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (27, 27))).astype(np.float32)
+        tail_soft = (cv2.GaussianBlur(tail_soft, (0, 0), 5) > 0.5).astype(np.float32)
+        body_calm = np.maximum(body_calm, tail_soft)
+
+        def sc(a):
+            return cv2.resize(a, (round(a.shape[1] * s), round(a.shape[0] * s)), interpolation=cv2.INTER_AREA)
+
+        self.sd_calm = signed_distance(sc(body_calm))
+        self.sd_spiky = signed_distance(sc(body_spiky))
+        self.eyes = sc(eyes)
+        self.legs = [(sc(p), (hx * s, hy * s)) for p, (hx, hy) in legs]
+        self.side_h, self.side_w = self.sd_calm.shape
+        ys = np.where(sc(sil).max(1) > 0.5)[0]
+        self.side_feet = ys.max()                        # sprite row that touches the ground
+
+        jump = ink_from(os.path.join(REF, 'cat-jump.png'), lo=0.2, hi=0.7)
+        body = jump[110:660, 70:580]
+        shadow = jump[720:810, 170:530]
+        jsil = fill_holes(body)
+        js = 0.36 / s                                    # the jump drawing is larger than the side view
+
+        def scj(a):
+            return sc(cv2.resize(a, (round(a.shape[1] * js), round(a.shape[0] * js)), interpolation=cv2.INTER_AREA))
+        self.jump = scj(jsil)
+        self.jump_eyes = scj(np.clip(jsil - (body > 0.5), 0, 1))
+        self.shadow = scj(shadow)
+        ys = np.where(self.jump.max(1) > 0.5)[0]
+        self.jump_feet = ys.max()
+
+    # -- pose from time ------------------------------------------------------------------
+    def pose(self, t):
+        """Returns None when off screen, else a dict describing the pose at time t."""
+        a, b = T_CAT_IN
+        if t < a or t > T_CAT_RUN[1] + 0.05:
+            return None
+        p = dict(bristle=0.0, flip=False, jump=False, lift=0.0, sx=1.0, sy=1.0, lean=0.0)
+        trot_f = 3.4                                     # strides per second
+        if t < b:
+            u = span(t, a, b)
+            # constant trot, braking hard over the last 12%
+            k = 0.88
+            d = u / k * (1 - 0.06) if u < k else (1 - 0.06) + 0.06 * (1 - (1 - (u - k) / (1 - k)) ** 2)
+            p['x'] = 2080 + (CAT_STOP_X - 2080) * d
+            amp = 26 * (1 - smooth((u - 0.85) / 0.15))
+            p['phase'] = (t - a) * trot_f
+            p['amp'] = amp
+        elif t < T_CAT_JUMP[0]:
+            p['x'] = CAT_STOP_X
+            p['phase'] = (b - a) * trot_f
+            p['amp'] = 0.0
+            br = smooth(span(t, *T_CAT_BRISTLE))
+            p['bristle'] = br
+            p['sy'] = 1 + 0.07 * br                      # arches up
+            p['sx'] = 1 - 0.03 * br
+            p['x'] = CAT_STOP_X + 10 * br                # a small flinch back
+        elif t < T_CAT_JUMP[1]:
+            u = span(t, *T_CAT_JUMP)
+            p.update(jump=True, x=CAT_STOP_X + 10, bristle=1.0, phase=0, amp=0)
+            p['lift'] = 150 * 4 * u * (1 - u)            # parabola
+            p['sy'] = 1 + 0.06 * np.sin(np.pi * u)       # stretched while airborne
+        else:
+            p.update(bristle=1.0, flip=True)
+            r0, r1 = T_CAT_RUN
+            if t < r0:                                   # landing squash, turning to flee
+                u = span(t, T_CAT_JUMP[1], r0)
+                p.update(x=CAT_STOP_X + 10, phase=0, amp=0, sy=1 - 0.1 * np.sin(np.pi * u), sx=1 + 0.08 * np.sin(np.pi * u))
+            else:
+                u = span(t, r0, r1)
+                p['x'] = CAT_STOP_X + 10 + 740 * u * u * (1.4 - 0.4 * u)   # accelerating dash
+                p['phase'] = (t - r0) * 7.0
+                p['amp'] = 34 * smooth(u / 0.2)
+                p['sx'] = 1 + 0.14 * smooth(u / 0.3)
+                p['sy'] = 1 - 0.05 * smooth(u / 0.3)
+                p['lean'] = 5 * smooth(u / 0.3)
+        p.setdefault('phase', 0); p.setdefault('amp', 0)
+        return p
+
+    # -- sprite ---------------------------------------------------------------------------
+    def sprite(self, p):
+        """Alpha, eye-white alpha and the feet row for this pose, in sprite space."""
+        if p['jump']:
+            return self.jump, self.jump_eyes, self.jump_feet
+        sd = self.sd_calm * (1 - p['bristle']) + self.sd_spiky * p['bristle']
+        alpha = np.clip(0.5 + sd, 0, 1)
+        bob = abs(np.sin(np.pi * 2 * p['phase'])) * 0.18 * p['amp']
+        pad = 30
+        h, w = alpha.shape
+        canvas = np.zeros((h + pad, w), np.float32)
+        eyes = np.zeros_like(canvas)
+        canvas[:h] = np.roll(alpha, -int(round(bob)), axis=0) if bob >= 0.5 else alpha
+        eyes[:h] = np.roll(self.eyes, -int(round(bob)), axis=0) if bob >= 0.5 else self.eyes
+        body = canvas.copy()
+        for i, (leg, (hx, hy)) in enumerate(self.legs):
+            # diagonal pairs move together: front-left with back-right
+            ph = 2 * np.pi * p['phase'] + (0 if i in (0, 3) else np.pi)
+            ang = p['amp'] * np.sin(ph)
+            up = max(0.0, np.cos(ph)) * p['amp'] * 0.22     # foot lifts on the forward swing
+            M = cv2.getRotationMatrix2D((hx, hy), ang, 1.0)
+            M[1, 2] -= up + bob
+            lp = np.zeros_like(canvas); lp[:h] = leg
+            canvas = np.maximum(canvas, cv2.warpAffine(lp, M, (w, h + pad), flags=cv2.INTER_LINEAR))
+        canvas = np.maximum(canvas, body)
+        return canvas, eyes, self.side_feet
+
+    def draw(self, t, rgb, A):
+        p = self.pose(t)
+        if p is None:
+            return
+        alpha, eyes, feet = self.sprite(p)
+        h, w = alpha.shape
+        # sprite -> page: scale about the feet, optional mirror, lean, subpixel translate
+        sx = p['sx'] * (-1 if p['flip'] else 1)
+        cx = w / 2
+        M = np.array([[sx, 0, 0], [0, p['sy'], 0]], np.float64)
+        M[0, 2] = p['x'] - sx * cx
+        M[1, 2] = CAT_GROUND - p['lift'] - p['sy'] * feet
+        if p['lean']:
+            R = cv2.getRotationMatrix2D((p['x'], CAT_GROUND), -p['lean'] * (1 if p['flip'] else -1), 1.0)
+            M = R @ np.vstack([M, [0, 0, 1]])
+        a = cv2.warpAffine(alpha, M, (W, H), flags=cv2.INTER_LINEAR)
+        e = cv2.warpAffine(eyes, M, (W, H), flags=cv2.INTER_LINEAR)
+        # ground shadow (from the jump reference), smaller and fainter the higher the cat is
+        k = 1 - p['lift'] / 220
+        sh = self.shadow
+        shw = (0.8 if not p['jump'] else 1.0) * k * p['sx']
+        S = np.array([[abs(shw) * 0.85, 0, 0], [0, 0.55 * k, 0]], np.float64)
+        S[0, 2] = p['x'] - abs(shw) * 0.85 * sh.shape[1] / 2
+        S[1, 2] = CAT_GROUND + 2 - 0.55 * k * sh.shape[0] / 2
+        s_a = cv2.warpAffine(sh, S, (W, H), flags=cv2.INTER_LINEAR) * (0.35 + 0.55 * k) * (1 if p['jump'] or p['lift'] > 0 else 0.6)
+        a = np.maximum(a, 0)
+        # clear a thin gap in the print around the cat so it reads over the ornaments
+        halo = cv2.dilate(a, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9)))
+        A *= 1 - halo
+        # shadow first, then the cat
+        for alpha_, col in ((s_a, INK), (a, INK), (e * a, CAT_EYE)):
+            al = np.clip(alpha_, 0, 1)
+            if col is CAT_EYE:
+                al = np.clip(e, 0, 1) * (a > 0.01)
+            newA = al + A * (1 - al)
+            rgb[:] = (col * al[..., None] + rgb * (A * (1 - al))[..., None]) / np.maximum(newA, 1e-6)[..., None]
+            A[:] = newA
+
+
 class Film:
     def __init__(self):
         self.lay = make_layers()
         _, self.wear, self.grain = make_paper()
+        self.cat = Cat()
         A = self.lay['A']
         self.baseline = A['baseline']
 
@@ -340,20 +551,13 @@ class Film:
         a_ink = np.clip(ink * dens, 0, 1)
         a_red = np.clip(red * dens * 0.9, 0, 1)
 
-        # ink colour, lifted toward a warm sheen where the gleam passes (alpha is untouched)
-        ink_rgb = np.broadcast_to(INK, (H, W, 3)).copy()
-        g = span(t, *T_GLEAM)
-        if 0 < g < 1:
-            x0, y0, x1, y1 = [int(v) for v in lay['A']['word_box']]
-            c = x0 - 300 + (x1 - x0 + 600) * ease_io(g)
-            yy, xx = np.mgrid[y0:y1, x0:x1].astype(np.float32)
-            band = np.exp(-(((xx + (yy - y0) * 0.45) - c) / 90) ** 2) * np.sin(np.pi * g) ** 0.7
-            band *= np.clip(0.8 + 0.2 * self.grain[0][y0:y1, x0:x1], 0.4, 1)
-            ink_rgb[y0:y1, x0:x1] += (SHEEN - INK) * (0.45 * band)[..., None]
+        ink_rgb = np.broadcast_to(INK, (H, W, 3))
 
         # straight-alpha RGBA: ink printed over the red plate
         A = 1 - (1 - a_ink) * (1 - a_red)
         rgb = (RED * (a_red * (1 - a_ink))[..., None] + ink_rgb * a_ink[..., None]) / np.maximum(A, 1e-6)[..., None]
+        # the cat is a solid cut-out on top of the print
+        self.cat.draw(t, rgb, A)
         out = np.dstack([np.clip(rgb, 0, 1), A])
         return (out * 255 + 0.5).astype(np.uint8)
 
