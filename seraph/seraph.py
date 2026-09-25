@@ -25,7 +25,7 @@ BODY_C = (271.0, 418.0)            # centre of the eye disc (reference px); the 
 T_RISE = (0.3, 3.0)
 T_HOVER = (3.0, 5.2)               # stops and stares to the left; the body leans after its gaze
 T_GATHER = (5.2, 5.52)             # slow deep downbeat, body dips
-T_EXIT = (5.52, 6.25)
+T_EXIT = (5.52, 6.65)               # swaying, accelerating climb out of the top
 SHUTTER = 0.5                      # fraction of a frame the shutter is open (180 degrees)
 SUBFRAMES = 5
 
@@ -136,9 +136,10 @@ EYE_MAIN = dict(c=(270.3, 417.5), ax=(20.5, 9.5), iris=(270.6, 417.0, 10.0))
 EYES_WING_LEFT = [((171, 270), (6.5, 12), 25, 2), ((187, 327), (6.5, 10), 40, 2),
                   ((176, 395), (9, 5.5), 10, 3), ((240, 490), (6, 9), -20, 4)]
 # blink times for the wing eyes (seconds); each eye gets its own moments
-WING_BLINKS = [[1.35, 4.55], [2.2, 3.7], [0.95, 4.15], [2.75, 5.0],     # left eyes
-               [1.7, 4.8], [0.7, 3.45], [2.45, 4.35], [1.15, 3.9]]      # right eyes
+WING_BLINKS = [[1.35, 4.55, 5.85], [2.2, 3.7, 6.1], [0.95, 4.15, 5.7], [2.75, 5.0, 6.2],     # left eyes
+               [1.7, 4.8, 6.0], [0.7, 3.45, 5.78], [2.45, 4.35, 6.15], [1.15, 3.9, 5.92]]  # right eyes
 MAIN_BLINK = 5.05
+MAIN_BLINK_EXIT = 6.02
 # per wing eye: tempo and phase of its small shifts while staring
 WING_ROLL = [(4.2, 0.3), (-5.1, 2.0), (3.4, 4.1), (-3.9, 1.1), (-4.6, 5.0), (5.4, 0.9), (-3.2, 3.3), (4.8, 2.6)]
 BLINK_LEN = 0.2
@@ -302,7 +303,7 @@ class Puppet:
     def body_at(self, t):
         img = self.parts[1]
         img = self.look(img, *gaze(t))
-        close = max(blink(t, MAIN_BLINK), squint(t))
+        close = max(blink(t, MAIN_BLINK), blink(t, MAIN_BLINK_EXIT), squint(t))
         if close > 0:
             c, ax = EYE_MAIN['c'], EYE_MAIN['ax']
             img = self.lid(img, c, (ax[0] * 0.95, ax[1] * 1.1), 0, self.main_lid, close)
@@ -374,7 +375,15 @@ def gaze(t):
         return (g[0] + m[0], g[1] + m[1])
     if t < 5.25:
         return mix(left, (0.0, 0.0), span(t, 5.0, 5.2))
-    return mix((0.0, 0.0), up, span(t, 5.25, 5.5))
+    ul, ur = (-RX * 0.75, -1.1), (RX * 0.75, -1.1)
+    if t < 5.36:
+        return mix((0.0, 0.0), ul, span(t, 5.25, 5.33))
+    if t < 5.5:
+        return mix(ul, ur, span(t, 5.4, 5.47))
+    # on the climb it keeps glancing the way it swings
+    v = velocity(t + 0.08)
+    follow = (RX * 0.85 * float(np.clip(v[0] / 220, -1, 1)), -1.1)
+    return mix(ur, follow, span(t, 5.5, 5.65))
 
 
 def squint(t):
@@ -388,13 +397,22 @@ def hover_env(t):
 
 
 def wing_gaze(t, i):
-    """In the hover every wing eye turns to the left as well, each with its own small shifts."""
+    """Hover: every wing eye looks left with its own small shifts. Climb: they dart about,
+    each following the swing with its own lag and a quick roll of its own."""
     env = hover_env(t)
     w, th0 = WING_ROLL[i]
     jit = 0.35 * np.sin(th0 + 1.7 * abs(w) * t) * np.sin(0.9 * w * t + th0) ** 2
     look = (-1.3 + jit, 0.2 * np.sin(th0 + abs(w) * 0.6 * t))
     rest = (0.0, -0.6)
-    return (rest[0] * (1 - env) + look[0] * env, rest[1] * (1 - env) + look[1] * env)
+    g = (rest[0] * (1 - env) + look[0] * env, rest[1] * (1 - env) + look[1] * env)
+    ex = exit_env(t)
+    if ex > 0:
+        v = velocity(t - 0.05 * (i % 4))
+        sw = float(np.clip(v[0] / 220, -1, 1))
+        th = th0 + w * 1.6 * (t - T_EXIT[0])
+        climb = (1.1 * sw + 0.4 * np.cos(th), -0.7 + 0.45 * np.sin(th))
+        g = (g[0] * (1 - ex) + climb[0] * ex, g[1] * (1 - ex) + climb[1] * ex)
+    return g
 
 
 def tilt(t):
@@ -464,16 +482,21 @@ def base_position(t):
     p[1] += 10 * np.sin(2 * np.pi * (t - T_HOVER[0]) / 1.3) * bob_amt
     if t > T_GATHER[0]:
         g = span(t, *T_GATHER)
-        p[1] += 18 * np.sin(np.pi * 0.5 * g) ** 2 * (1 - smooth(span(t, T_GATHER[1], T_GATHER[1] + 0.12)))
+        p[1] += 18 * np.sin(np.pi * 0.5 * g) ** 2 * (1 - smooth(span(t, T_GATHER[1] - 0.05, T_GATHER[1] + 0.4)))
     if t > T_EXIT[0]:
         u = span(t, *T_EXIT)
-        p[1] -= 870 * u ** 2.4
-        p[0] += 10 * u
+        p[1] -= 900 * (0.22 * smooth(u / 0.5) * u + 0.78 * u ** 2.3)     # starts from rest
+        # it weaves from side to side as it climbs, the swing opening up as it gains speed
+        p[0] += 62 * smooth(u / 0.3) * np.sin(2 * np.pi * 1.45 * u - 0.4) + 25 * np.sin(np.pi * u) ** 2
     return p
 
 
 def velocity(t, dt=1 / 240):
     return (base_position(t + dt) - base_position(t - dt)) / (2 * dt)
+
+
+def exit_env(t):
+    return smooth(span(t, T_GATHER[1] - 0.05, T_EXIT[0] + 0.2))
 
 
 def pose(t):
@@ -483,12 +506,18 @@ def pose(t):
     pos = pos + np.array([0.0, -5.0 * downstroke_push(ph)])
     v = velocity(t)
     speed = np.hypot(*v)
-    lean = np.clip(-np.degrees(np.arctan2(v[0], -v[1] + 1e-6)) * 0.5, -6, 6) * smooth(speed / 250)
+    ex = exit_env(t)
+    lim = 6 + 8 * ex
+    raw = -np.degrees(np.arctan2(v[0], -v[1] + 1e-6)) * 0.5
+    lean = float(np.clip(raw, -6, 6)) * smooth(speed / 250) * (1 - ex)
+    # on the climb it banks with its sideways speed, a smooth swing rather than a flip
+    lean += -16 * np.tanh(v[0] / 700) * ex
     # staring: lean toward the side it looks at (counter-clockwise = left) and edge that way
     tl = tilt(t)
     lean += -8.0 * tl
     pos = pos + np.array([12.0 * tl, 0.0])
     stretch = 1 + 0.04 * smooth((speed - 500) / 900) if t > T_EXIT[0] else 1.0
+    stretch += 0.035 * ex * downstroke_push(ph)       # each beat on the climb pulls it longer
     # deep gather beat: bigger amplitude on the downbeat before the exit
     gain = 1 + 0.6 * np.sin(np.pi * span(t, T_GATHER[0] - 0.15, T_GATHER[1])) ** 2
     return pos, ph, lean, stretch, gain
@@ -500,7 +529,7 @@ class Film:
         self.p = Puppet()
         rng = np.random.default_rng(11)
         # shed feathers: spawn time, offset from the body, fall speed, sway, spin, size
-        spawns = list(rng.uniform(0.7, 2.8, 7)) + list(rng.uniform(5.4, 6.1, 4))
+        spawns = list(rng.uniform(0.7, 2.8, 7)) + list(rng.uniform(5.5, 6.4, 5))
         self.feathers = []
         for i, ts in enumerate(sorted(spawns)):
             self.feathers.append(dict(t0=ts, off=(rng.uniform(-120, 120), rng.uniform(-60, 90)),
@@ -534,7 +563,9 @@ class Film:
         for pid in ORDER:
             k = pid % 10
             sign = -1 if pid < 10 else 1          # left wings rotate clockwise on the upstroke
-            st = stroke(ph - LAG[k])
+            # on the climb the right side beats a little behind the left, so the body rocks
+            side_lag = 0.13 * exit_env(t) if pid >= 10 else 0.0
+            st = stroke(ph - LAG[k] - side_lag)
             if k == 2:
                 # the tall upper wings mostly open outward; on the upstroke they only just close
                 st = 0.55 * st - 0.35
