@@ -1,10 +1,10 @@
-"""Seraph — 6 s flight: rises from the bottom-right corner, hovers near the top, shoots off upward.
+"""Seraph — 7 s flight: rises from the bottom-right corner, hovers near the top, shoots off upward.
 
 The seraph is a cut-out puppet built from refs/seraph.png: a static body (eye disc, neck, tail)
 and six wings that rotate about their roots. Every frame is a pure function of time t.
 
   python3 seraph.py still 3.6 out/hover.png
-  python3 seraph.py sheet 0.3:5.6:0.35 out/sheet.png
+  python3 seraph.py sheet 0.2:6.8:0.44 out/sheet.png
   python3 seraph.py cycle out/cycle.png          # one wing beat of the isolated puppet
   python3 seraph.py render seraph [--fps 60]     # seraph.mov, seraph.webm, seraph-preview.mp4
 """
@@ -16,16 +16,16 @@ from PIL import Image, ImageDraw
 HERE = os.path.dirname(os.path.abspath(__file__))
 REF = os.path.join(HERE, 'refs', 'seraph.png')
 W, H = 1920, 1080
-DURATION = 6.0
+DURATION = 7.0
 S = 360 / 674                      # reference -> screen scale (seraph ~360 px tall)
 AXIS = 270.5                       # mirror axis of the reference
 BODY_C = (271.0, 418.0)            # centre of the eye disc (reference px); the puppet's origin
 
 # ---------------------------------------------------------------- timeline (seconds)
 T_RISE = (0.3, 3.0)
-T_HOVER = (3.0, 4.3)
-T_GATHER = (4.3, 4.62)             # slow deep downbeat, body dips
-T_EXIT = (4.62, 5.35)
+T_HOVER = (3.0, 5.2)               # stops and looks around: eyes roll, the body tilts after its gaze
+T_GATHER = (5.2, 5.52)             # slow deep downbeat, body dips
+T_EXIT = (5.52, 6.25)
 SHUTTER = 0.5                      # fraction of a frame the shutter is open (180 degrees)
 SUBFRAMES = 5
 
@@ -136,9 +136,11 @@ EYE_MAIN = dict(c=(270.3, 417.5), ax=(20.5, 9.5), iris=(270.6, 417.0, 10.0))
 EYES_WING_LEFT = [((171, 270), (6.5, 12), 25, 2), ((187, 327), (6.5, 10), 40, 2),
                   ((176, 395), (9, 5.5), 10, 3), ((240, 490), (6, 9), -20, 4)]
 # blink times for the wing eyes (seconds); each eye gets its own moments
-WING_BLINKS = [[1.35, 4.05], [2.2], [0.95, 3.55], [2.75],     # left eyes
-               [1.7], [0.7, 3.3], [2.45, 4.4], [1.15, 3.8]]   # right eyes
-MAIN_BLINK = 3.62
+WING_BLINKS = [[1.35, 4.55], [2.2, 3.7], [0.95, 4.15], [2.75, 5.0],     # left eyes
+               [1.7, 4.8], [0.7, 3.45], [2.45, 4.35], [1.15, 3.9]]      # right eyes
+MAIN_BLINK = 5.05
+# wing-eye roll during the hover: angular speed (rad/s, sign = direction) and start angle per eye
+WING_ROLL = [(4.2, 0.3), (-5.1, 2.0), (3.4, 4.1), (-3.9, 1.1), (-4.6, 5.0), (5.4, 0.9), (-3.2, 3.3), (4.8, 2.6)]
 BLINK_LEN = 0.2
 
 
@@ -195,6 +197,7 @@ class Puppet:
         for (c, ax, rot, pid) in self.wing_eyes:
             ring = self.ring_color(rgb, c, ax)
             self.eye_lid_rgb.append(ring)
+        self.eye_sclera = [self.sclera_color(rgb, c, ax) for (c, ax, rot, pid) in self.wing_eyes]
         self.main_lid = self.ring_color(rgb, EYE_MAIN['c'], (EYE_MAIN['ax'][0] + 4, EYE_MAIN['ax'][1] + 6))
         self.sclera = np.array([0.80, 0.78, 0.74], np.float32)
 
@@ -204,6 +207,41 @@ class Puppet:
         r = np.hypot((xx - c[0]) / ax[0], (yy - c[1]) / ax[1])
         m = (r > 1.25) & (r < 1.9)
         return np.median(rgb[m], axis=0).astype(np.float32)
+
+    @staticmethod
+    def sclera_color(rgb, c, ax):
+        yy, xx = np.mgrid[0:rgb.shape[0], 0:rgb.shape[1]]
+        m = np.hypot((xx - c[0]) / ax[0], (yy - c[1]) / ax[1]) < 1
+        px = rgb[m]
+        lum = px.mean(1)
+        return np.median(px[lum >= np.percentile(lum, 75)], axis=0).astype(np.float32)
+
+    def shift_iris(self, img, c, ax, rot, sclera, dx, dy):
+        """Roll a small wing eye: its dark iris slides inside the opening by (dx, dy) screen px."""
+        if abs(dx) < 1e-3 and abs(dy) < 1e-3:
+            return img
+        img = img.copy()
+        cx, cy = c[0] * S, c[1] * S
+        ax_ = (ax[0] * S, ax[1] * S)
+        r = int(max(ax_) + 5)
+        x0, y0 = int(cx) - r, int(cy) - r
+        patch = img[y0:y0 + 2 * r, x0:x0 + 2 * r].copy()
+        yy, xx = np.mgrid[y0:y0 + 2 * r, x0:x0 + 2 * r].astype(np.float32)
+        th = np.radians(rot)
+        u = (xx - cx) * np.cos(th) + (yy - cy) * np.sin(th)
+        v = -(xx - cx) * np.sin(th) + (yy - cy) * np.cos(th)
+        eye = np.clip((1 - np.hypot(u / ax_[0], v / ax_[1])) * 3, 0, 1)
+        a = patch[..., 3:4]
+        lum = (patch[..., :3] / np.maximum(a, 1e-6)).mean(2)
+        thr = np.percentile(lum[eye > 0.5], 45)
+        iris = np.clip((thr - lum) / 0.06 + 0.5, 0, 1) * (eye > 0.2)
+        moved = cv2.warpAffine(patch * iris[..., None], np.float32([[1, 0, dx], [0, 1, dy]]), (2 * r, 2 * r),
+                               flags=cv2.INTER_LINEAR)
+        base = np.concatenate([sclera * a, a], 2)
+        inner = moved + base * (1 - moved[..., 3:4] / np.maximum(a, 1e-6))
+        e = eye[..., None]
+        img[y0:y0 + 2 * r, x0:x0 + 2 * r] = patch * (1 - e) + inner * e
+        return img
 
     def scaled(self, col, a):
         """Premultiplied RGBA at screen scale (one area-filtered resize from the reference)."""
@@ -275,6 +313,7 @@ class Puppet:
         for i, (c, ax, rot, owner) in enumerate(self.wing_eyes):
             if owner != pid:
                 continue
+            img = self.shift_iris(img, c, ax, rot, self.eye_sclera[i], *wing_gaze(t, i))
             close = max([blink(t, b) for b in WING_BLINKS[i]] + [0])
             if close > 0:
                 img = self.lid(img, c, ax, rot, self.eye_lid_rgb[i], close)
@@ -288,17 +327,60 @@ def blink(t, at):
     return float(np.sin(np.pi * u) ** 0.7)
 
 
+RX, RY = 3.4, 1.4                  # how far the central iris can travel (screen px)
+
+
+def _roll(t, ta, tb, th0, th1):
+    u = smooth(span(t, ta, tb))
+    th = th0 + (th1 - th0) * u
+    return (RX * np.cos(th), RY * np.sin(th))
+
+
 def gaze(t):
-    """Central iris offset (screen px): toward travel while rising, then looks around in the hover."""
-    d = 1.6
-    keys = [(0.0, (-0.5 * d, -0.6 * d)), (2.7, (-0.5 * d, -0.6 * d)), (3.1, (-d, 0.0)), (3.45, (-d, 0.0)),
-            (3.8, (0.9 * d, 0.1)), (4.1, (0.9 * d, 0.1)), (4.35, (0.0, 0.0)), (4.6, (0.0, -0.8 * d)),
-            (9.0, (0.0, -0.8 * d))]
-    for (ta, a), (tb, b) in zip(keys, keys[1:]):
-        if ta <= t <= tb:
-            u = smooth((t - ta) / (tb - ta))
-            return (a[0] + (b[0] - a[0]) * u, a[1] + (b[1] - a[1]) * u)
-    return (0.0, 0.0)
+    """Central iris offset (screen px). Looks ahead while rising; in the hover it glances left,
+    rolls up and over to the right, holds, spins a full circle, then settles on the viewer."""
+    ahead = (-0.8, -0.9)
+    up = (0.0, -1.2)
+    left = (-RX, 0.3)
+
+    def mix(p, q, u):
+        u = smooth(u)
+        return (p[0] + (q[0] - p[0]) * u, p[1] + (q[1] - p[1]) * u)
+
+    if t < 2.75:
+        return ahead
+    if t < 3.2:
+        return mix(ahead, left, span(t, 2.75, 3.2))
+    if t < 3.6:
+        return (left[0], left[1] - 0.3 * np.sin(np.pi * span(t, 3.2, 3.6)))
+    if t < 4.05:                                      # left -> up -> right
+        return mix(left, _roll(t, 3.6, 4.05, np.pi, 2 * np.pi), min(1, span(t, 3.6, 3.7) * 4))
+    if t < 4.4:
+        return (RX, 0.0)
+    if t < 4.95:                                      # a full spin: right -> up -> left -> down -> right
+        return _roll(t, 4.4, 4.95, 0.0, -2 * np.pi)
+    if t < 5.2:
+        return mix((RX, 0.0), (0.0, 0.0), span(t, 4.95, 5.15))
+    return mix((0.0, 0.0), up, span(t, 5.25, 5.5))
+
+
+def hover_env(t):
+    return smooth(span(t, T_HOVER[0] - 0.2, T_HOVER[0] + 0.3)) * (1 - smooth(span(t, T_HOVER[1] - 0.2, T_HOVER[1] + 0.1)))
+
+
+def wing_gaze(t, i):
+    """Each wing eye rolls its iris in its own direction and tempo while the seraph hovers."""
+    w, th0 = WING_ROLL[i]
+    env = hover_env(t)
+    th = th0 + w * max(0.0, t - T_HOVER[0])
+    roll = (1.3 * np.cos(th), 1.0 * np.sin(th))
+    rest = (0.0, -0.6)
+    return (rest[0] * (1 - env) + roll[0] * env, rest[1] * (1 - env) + roll[1] * env)
+
+
+def tilt(t):
+    """-1..1: the body leans after the gaze (a little behind it) during the hover."""
+    return float(np.clip(gaze(t - 0.14)[0] / RX, -1, 1)) * hover_env(t)
 
 
 # ---------------------------------------------------------------- motion
@@ -383,6 +465,10 @@ def pose(t):
     v = velocity(t)
     speed = np.hypot(*v)
     lean = np.clip(-np.degrees(np.arctan2(v[0], -v[1] + 1e-6)) * 0.5, -6, 6) * smooth(speed / 250)
+    # looking around: lean toward the side it looks at (counter-clockwise = left) and drift that way
+    tl = tilt(t)
+    lean += -8.0 * tl
+    pos = pos + np.array([7.0 * tl, 0.0])
     stretch = 1 + 0.04 * smooth((speed - 500) / 900) if t > T_EXIT[0] else 1.0
     # deep gather beat: bigger amplitude on the downbeat before the exit
     gain = 1 + 0.6 * np.sin(np.pi * span(t, T_GATHER[0] - 0.15, T_GATHER[1])) ** 2
@@ -395,7 +481,7 @@ class Film:
         self.p = Puppet()
         rng = np.random.default_rng(11)
         # shed feathers: spawn time, offset from the body, fall speed, sway, spin, size
-        spawns = list(rng.uniform(0.7, 2.8, 7)) + list(rng.uniform(4.5, 5.2, 4))
+        spawns = list(rng.uniform(0.7, 2.8, 7)) + list(rng.uniform(5.4, 6.1, 4))
         self.feathers = []
         for i, ts in enumerate(sorted(spawns)):
             self.feathers.append(dict(t0=ts, off=(rng.uniform(-120, 120), rng.uniform(-60, 90)),
@@ -528,7 +614,7 @@ if __name__ == '__main__':
         sheet(film, list(np.arange(a, b + 1e-6, s)), sys.argv[3])
     elif cmd == 'cycle':
         # one beat of the isolated puppet at the hover, 12 frames, on light and dark backgrounds
-        t0 = 3.3
+        t0 = 3.5
         f0 = beat_freq(t0)
         tiles = []
         for i in range(12):
