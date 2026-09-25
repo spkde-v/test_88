@@ -23,7 +23,7 @@ BODY_C = (271.0, 418.0)            # centre of the eye disc (reference px); the 
 
 # ---------------------------------------------------------------- timeline (seconds)
 T_RISE = (0.3, 3.0)
-T_HOVER = (3.0, 5.2)               # stops and looks around: eyes roll, the body tilts after its gaze
+T_HOVER = (3.0, 5.2)               # stops and stares to the left; the body leans after its gaze
 T_GATHER = (5.2, 5.52)             # slow deep downbeat, body dips
 T_EXIT = (5.52, 6.25)
 SHUTTER = 0.5                      # fraction of a frame the shutter is open (180 degrees)
@@ -139,7 +139,7 @@ EYES_WING_LEFT = [((171, 270), (6.5, 12), 25, 2), ((187, 327), (6.5, 10), 40, 2)
 WING_BLINKS = [[1.35, 4.55], [2.2, 3.7], [0.95, 4.15], [2.75, 5.0],     # left eyes
                [1.7, 4.8], [0.7, 3.45], [2.45, 4.35], [1.15, 3.9]]      # right eyes
 MAIN_BLINK = 5.05
-# wing-eye roll during the hover: angular speed (rad/s, sign = direction) and start angle per eye
+# per wing eye: tempo and phase of its small shifts while staring
 WING_ROLL = [(4.2, 0.3), (-5.1, 2.0), (3.4, 4.1), (-3.9, 1.1), (-4.6, 5.0), (5.4, 0.9), (-3.2, 3.3), (4.8, 2.6)]
 BLINK_LEN = 0.2
 
@@ -302,7 +302,7 @@ class Puppet:
     def body_at(self, t):
         img = self.parts[1]
         img = self.look(img, *gaze(t))
-        close = blink(t, MAIN_BLINK)
+        close = max(blink(t, MAIN_BLINK), squint(t))
         if close > 0:
             c, ax = EYE_MAIN['c'], EYE_MAIN['ax']
             img = self.lid(img, c, (ax[0] * 0.95, ax[1] * 1.1), 0, self.main_lid, close)
@@ -336,12 +336,28 @@ def _roll(t, ta, tb, th0, th1):
     return (RX * np.cos(th), RY * np.sin(th))
 
 
+def _micro(t, steps):
+    """Small fixational eye movements: a chain of tiny, quick, smoothed steps (px)."""
+    x = y = 0.0
+    for ts, dx, dy in steps:
+        u = smooth((t - ts) / 0.07)
+        x += dx * u
+        y += dy * u
+    return x, y
+
+
+# (time, dx, dy): little shifts while it stares; they sum back to ~0 before the gaze leaves
+MICRO_MAIN = [(3.38, 0.35, -0.25), (3.62, -0.3, 0.35), (3.83, 0.25, 0.1), (4.38, 0.3, -0.3),
+              (4.58, -0.45, 0.2), (4.8, -0.15, -0.1)]
+
+
 def gaze(t):
-    """Central iris offset (screen px). Looks ahead while rising; in the hover it glances left,
-    rolls up and over to the right, holds, spins a full circle, then settles on the viewer."""
+    """Central iris offset (screen px). Looks ahead while rising; in the hover it turns to the left
+    and stares there attentively: tiny fixational shifts, one peer a little higher, then back."""
     ahead = (-0.8, -0.9)
     up = (0.0, -1.2)
-    left = (-RX, 0.3)
+    left = (-RX, 0.25)
+    peer = (-RX * 0.95, -0.9)
 
     def mix(p, q, u):
         u = smooth(u)
@@ -351,17 +367,20 @@ def gaze(t):
         return ahead
     if t < 3.2:
         return mix(ahead, left, span(t, 2.75, 3.2))
-    if t < 3.6:
-        return (left[0], left[1] - 0.3 * np.sin(np.pi * span(t, 3.2, 3.6)))
-    if t < 4.05:                                      # left -> up -> right
-        return mix(left, _roll(t, 3.6, 4.05, np.pi, 2 * np.pi), min(1, span(t, 3.6, 3.7) * 4))
-    if t < 4.4:
-        return (RX, 0.0)
-    if t < 4.95:                                      # a full spin: right -> up -> left -> down -> right
-        return _roll(t, 4.4, 4.95, 0.0, -2 * np.pi)
-    if t < 5.2:
-        return mix((RX, 0.0), (0.0, 0.0), span(t, 4.95, 5.15))
+    if t < 5.0:
+        g = mix(left, peer, span(t, 3.95, 4.15))
+        g = mix(g, left, span(t, 4.25, 4.45)) if t > 4.25 else g
+        m = _micro(t, MICRO_MAIN)
+        return (g[0] + m[0], g[1] + m[1])
+    if t < 5.25:
+        return mix(left, (0.0, 0.0), span(t, 5.0, 5.2))
     return mix((0.0, 0.0), up, span(t, 5.25, 5.5))
+
+
+def squint(t):
+    """Lids narrow a little while it stares (0 = open)."""
+    return 0.3 * smooth(span(t, 3.5, 3.9)) * (1 - smooth(span(t, 4.75, 5.0))) + \
+        0.12 * np.sin(np.pi * span(t, 3.95, 4.3)) ** 2
 
 
 def hover_env(t):
@@ -369,13 +388,13 @@ def hover_env(t):
 
 
 def wing_gaze(t, i):
-    """Each wing eye rolls its iris in its own direction and tempo while the seraph hovers."""
-    w, th0 = WING_ROLL[i]
+    """In the hover every wing eye turns to the left as well, each with its own small shifts."""
     env = hover_env(t)
-    th = th0 + w * max(0.0, t - T_HOVER[0])
-    roll = (1.3 * np.cos(th), 1.0 * np.sin(th))
+    w, th0 = WING_ROLL[i]
+    jit = 0.35 * np.sin(th0 + 1.7 * abs(w) * t) * np.sin(0.9 * w * t + th0) ** 2
+    look = (-1.3 + jit, 0.2 * np.sin(th0 + abs(w) * 0.6 * t))
     rest = (0.0, -0.6)
-    return (rest[0] * (1 - env) + roll[0] * env, rest[1] * (1 - env) + roll[1] * env)
+    return (rest[0] * (1 - env) + look[0] * env, rest[1] * (1 - env) + look[1] * env)
 
 
 def tilt(t):
@@ -465,10 +484,10 @@ def pose(t):
     v = velocity(t)
     speed = np.hypot(*v)
     lean = np.clip(-np.degrees(np.arctan2(v[0], -v[1] + 1e-6)) * 0.5, -6, 6) * smooth(speed / 250)
-    # looking around: lean toward the side it looks at (counter-clockwise = left) and drift that way
+    # staring: lean toward the side it looks at (counter-clockwise = left) and edge that way
     tl = tilt(t)
     lean += -8.0 * tl
-    pos = pos + np.array([7.0 * tl, 0.0])
+    pos = pos + np.array([12.0 * tl, 0.0])
     stretch = 1 + 0.04 * smooth((speed - 500) / 900) if t > T_EXIT[0] else 1.0
     # deep gather beat: bigger amplitude on the downbeat before the exit
     gain = 1 + 0.6 * np.sin(np.pi * span(t, T_GATHER[0] - 0.15, T_GATHER[1])) ** 2
