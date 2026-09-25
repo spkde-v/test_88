@@ -22,13 +22,15 @@ DURATION = 5.0
 PAPER = np.array([238, 229, 211], np.float32) / 255
 INK = np.array([33, 27, 30], np.float32) / 255      # warm overprint dark, never pure black
 RED = np.array([150, 28, 38], np.float32) / 255
+SHEEN = np.array([150, 140, 128], np.float32) / 255
 
 # ---------------------------------------------------------------- timeline (seconds)
 T_LETTERS = (0.5, 2.9)       # glyphs bleed in, left to right
 T_L_EXTRA = 0.35             # the capital runs longer than the others
 STAGGER = 0.13
-T_SWORDS = (1.5, 3.5)
-T_CORNERS = (1.4, 3.8)
+# corner vines: (start, duration, ease-out power) per corner — deliberately unequal so they
+# don't grow in lockstep. Order: bottom right, bottom left, top right, top left.
+T_CORNERS = [(0.25, 4.0, 1.3), (0.6, 3.5, 1.7), (0.0, 3.7, 1.5), (0.45, 4.3, 1.9)]
 T_ROSE = (2.2, 3.8)
 T_GLEAM = (3.7, 4.55)
 
@@ -225,24 +227,17 @@ def make_layers():
     ys, xs = np.nonzero(cv > 0.4)
     corner_pt = np.argmax(xs * 0.6 + ys)                              # bottom-right-most ink
     geo = geodesic(cv > 0.35, [(ys[corner_pt], xs[corner_pt])], step=2)
-    fc = 0.85 * geo + 0.15 * rank_noise(cv.shape, 6, 3)
     m = 38
-    layers['corners'] = [
-        Layer(cv, W - m - cw, H - m - ch, fc, soft=0.25),                                     # bottom right
-        Layer(cv[:, ::-1], m, H - m - ch, fc[:, ::-1], soft=0.25),                            # bottom left
-        Layer(cv[::-1, :], W - m - cw, m, fc[::-1, :], soft=0.25),                            # top right
-        Layer(cv[::-1, ::-1], m, m, fc[::-1, ::-1], soft=0.25),                              # top left
-    ]
-
-    # crossed rapiers behind the word, pale; they condense from paper tone outward from the cross
-    sw = crop(ink_from(os.path.join(REF, 'crossed-swords.png'), lo=0.15, hi=0.8))
-    sw = fit(sw, height=600)
-    sh, sww = sw.shape
-    yy, xx = np.mgrid[0:sh, 0:sww].astype(np.float32)
-    r = np.hypot((xx - sww * 0.5) / sww, (yy - sh * 0.47) / sh)
-    fs = 0.45 * (r / r.max()) + 0.55 * rank_noise(sw.shape, 22, 4)
-    fs = (fs - fs.min()) / (fs.max() - fs.min())
-    layers['swords'] = Layer(sw * 0.27, (W - sww) / 2 + 40, 455 - sh / 2, fs, soft=0.3, blur=10)
+    places = [(lambda a: a, W - m - cw, H - m - ch),                   # bottom right
+              (lambda a: a[:, ::-1], m, H - m - ch),                     # bottom left
+              (lambda a: a[::-1, :], W - m - cw, m),                     # top right
+              (lambda a: a[::-1, ::-1], m, m)]                           # top left
+    layers['corners'] = []
+    for k, (flip, x, y) in enumerate(places):
+        # each corner gets its own noise and its own balance of growth vs. blotchy bleed
+        mix = (0.88, 0.72, 0.8, 0.65)[k]
+        fc = mix * geo + (1 - mix) * rank_noise(cv.shape, (5, 9, 7, 12)[k], 40 + k)
+        layers['corners'].append(Layer(flip(cv), x, y, flip(fc), soft=(0.3, 0.42, 0.34, 0.5)[k]))
 
     # sword wrapped in a thorned rose, laid flat under the word as a divider
     rs = ink_from(os.path.join(REF, 'rose-sword.png'), lo=0.1, hi=0.78)
@@ -307,16 +302,9 @@ def make_paper():
 class Film:
     def __init__(self):
         self.lay = make_layers()
-        self.paper, self.wear, self.grain = make_paper()
+        _, self.wear, self.grain = make_paper()
         A = self.lay['A']
         self.baseline = A['baseline']
-        rng = np.random.default_rng(99)
-        n = 70
-        self.specks = np.stack([rng.uniform(0, W, n), rng.uniform(0, H, n), rng.uniform(0.6, 2.2, n),
-                                rng.uniform(-9, 9, n), rng.uniform(-14, -3, n), rng.uniform(0, 1, n)], 1)
-
-    def progress(self):
-        pass
 
     def frame(self, t):
         ink = np.zeros((H, W), np.float32)
@@ -335,55 +323,55 @@ class Film:
 
         a, b = T_LETTERS
         glyph_len = (b - a) - STAGGER * len(lay['glyphs'])
-        put(lay['swords'], ease_io(span(t, *T_SWORDS)))
-        # knock the pale swords out behind the word so the letters own their value
         put(lay['L'], span(t, a, a + glyph_len + T_L_EXTRA))
         for i, g in enumerate(lay['glyphs']):
             s = a + STAGGER * (i + 1) + 0.05
             put(g, span(t, s, s + glyph_len))
-        cp = [T_CORNERS[0] + k * 0.12 for k in range(4)]
-        for k, c in enumerate(lay['corners']):
-            put(c, ease_io(span(t, cp[k], cp[k] + (T_CORNERS[1] - T_CORNERS[0]) - 0.36)))
+        for c, (st, du, pw) in zip(lay['corners'], T_CORNERS):
+            put(c, 1 - (1 - span(t, st, st + du)) ** pw)       # starts growing at once, settles slowly
         put(lay['rose'], ease_io(span(t, *T_ROSE)))
         put(lay['rose_red'], ease_io(span(t, T_ROSE[0] + 0.3, T_ROSE[1] + 0.35)))
 
-        # gleam: a soft diagonal band of light passes over the capital and the word
-        g = span(t, *T_GLEAM)
-        if 0 < g < 1:
-            x0, y0, x1, y1 = lay['A']['word_box']
-            c = x0 - 300 + (x1 - x0 + 600) * ease_io(g)
-            yy, xx = np.mgrid[int(y0):int(y1), int(x0):int(x1)].astype(np.float32)
-            band = np.exp(-(((xx + (yy - y0) * 0.45) - c) / 90) ** 2) * np.sin(np.pi * g) ** 0.7
-            sl = ink[int(y0):int(y1), int(x0):int(x1)]
-            sl *= 1 - 0.3 * band * np.clip(0.8 + 0.2 * self.grain[0][int(y0):int(y1), int(x0):int(x1)], 0.4, 1)
-
-        # ink specks drifting on the bare paper, settling as the title prints
-        k = 1 - 0.8 * smooth((t - 0.4) / 2.0)
-        if k > 0:
-            for sx, sy, r, vx, vy, ph in self.specks:
-                px = sx + vx * t
-                py = (sy + vy * t) % H
-                al = 0.22 * k * (0.5 + 0.5 * np.sin(2 * np.pi * (ph + t * 0.35)))
-                cv2.circle(ink, (int(px * 4), int(py * 4)), int(r * 4), float(al), -1, cv2.LINE_AA, shift=2)
-
-        # breathing paper grain: three fixed textures cross-faded slowly (no per-frame noise crawl)
+        # breathing grain: three fixed textures cross-faded slowly (no per-frame noise crawl)
         ph = t * 0.6
         wts = [0.5 + 0.5 * np.cos(2 * np.pi * (ph - j / 3)) for j in range(3)]
         gr = sum(w_ * g_ for w_, g_ in zip(wts, self.grain)) / sum(wts)
         dens = self.wear * (1 + 0.05 * gr)
+        a_ink = np.clip(ink * dens, 0, 1)
+        a_red = np.clip(red * dens * 0.9, 0, 1)
 
-        a_ink = np.clip(ink * dens, 0, 1)[..., None]
-        a_red = np.clip(red * dens * 0.9, 0, 1)[..., None]
-        out = self.paper * (1 - a_red * (1 - RED / PAPER))
-        out = out * (1 - a_ink * (1 - INK / PAPER))
+        # ink colour, lifted toward a warm sheen where the gleam passes (alpha is untouched)
+        ink_rgb = np.broadcast_to(INK, (H, W, 3)).copy()
+        g = span(t, *T_GLEAM)
+        if 0 < g < 1:
+            x0, y0, x1, y1 = [int(v) for v in lay['A']['word_box']]
+            c = x0 - 300 + (x1 - x0 + 600) * ease_io(g)
+            yy, xx = np.mgrid[y0:y1, x0:x1].astype(np.float32)
+            band = np.exp(-(((xx + (yy - y0) * 0.45) - c) / 90) ** 2) * np.sin(np.pi * g) ** 0.7
+            band *= np.clip(0.8 + 0.2 * self.grain[0][y0:y1, x0:x1], 0.4, 1)
+            ink_rgb[y0:y1, x0:x1] += (SHEEN - INK) * (0.45 * band)[..., None]
 
-        return (np.clip(out, 0, 1) * 255 + 0.5).astype(np.uint8)
+        # straight-alpha RGBA: ink printed over the red plate
+        A = 1 - (1 - a_ink) * (1 - a_red)
+        rgb = (RED * (a_red * (1 - a_ink))[..., None] + ink_rgb * a_ink[..., None]) / np.maximum(A, 1e-6)[..., None]
+        out = np.dstack([np.clip(rgb, 0, 1), A])
+        return (out * 255 + 0.5).astype(np.uint8)
+
+
+def over(rgba, bg):
+    """Composite an RGBA frame onto a solid colour (for previews and sheets)."""
+    a = rgba[..., 3:4].astype(np.float32) / 255
+    bg = np.array(bg, np.float32)
+    return (rgba[..., :3] * a + bg * (1 - a) + 0.5).astype(np.uint8)
+
+
+PREVIEW_BG = (236, 228, 212)
 
 
 def sheet(film, times, path, cols=4):
     tiles = []
     for t in times:
-        f = cv2.resize(film.frame(t), (480, 270), interpolation=cv2.INTER_AREA)
+        f = cv2.resize(over(film.frame(t), PREVIEW_BG), (480, 270), interpolation=cv2.INTER_AREA)
         im = Image.fromarray(f)
         ImageDraw.Draw(im).text((8, 6), f't={t:.2f}', fill=(200, 0, 0))
         tiles.append(np.asarray(im))
@@ -402,15 +390,27 @@ if __name__ == '__main__':
         a, b, s = map(float, sys.argv[2].split(':'))
         sheet(film, list(np.arange(a, b + 1e-6, s)), sys.argv[3])
     elif cmd == 'render':
-        out = sys.argv[2]
+        # one pass feeds three encoders: ProRes 4444 and VP9 keep the alpha, the MP4 is a preview on paper
+        stem = sys.argv[2]
         fps = int(sys.argv[sys.argv.index('--fps') + 1]) if '--fps' in sys.argv else 60
         import imageio_ffmpeg
         ff = imageio_ffmpeg.get_ffmpeg_exe()
-        p = subprocess.Popen([ff, '-y', '-f', 'rawvideo', '-pix_fmt', 'rgb24', '-s', f'{W}x{H}', '-r', str(fps),
-                              '-i', '-', '-c:v', 'libx264', '-preset', 'slow', '-crf', '14',
-                              '-pix_fmt', 'yuv420p', '-movflags', '+faststart', out], stdin=subprocess.PIPE)
+        src = [ff, '-y', '-loglevel', 'error', '-f', 'rawvideo', '-s', f'{W}x{H}', '-r', str(fps)]
+        jobs = [
+            (src + ['-pix_fmt', 'rgba', '-i', '-', '-c:v', 'prores_ks', '-profile:v', '4444',
+                    '-pix_fmt', 'yuva444p10le', '-alpha_bits', '16', '-vendor', 'apl0', stem + '.mov'], True),
+            (src + ['-pix_fmt', 'rgba', '-i', '-', '-c:v', 'libvpx-vp9', '-pix_fmt', 'yuva420p',
+                    '-b:v', '0', '-crf', '18', '-row-mt', '1', '-auto-alt-ref', '0', stem + '.webm'], True),
+            (src + ['-pix_fmt', 'rgb24', '-i', '-', '-c:v', 'libx264', '-preset', 'slow', '-crf', '14',
+                    '-pix_fmt', 'yuv420p', '-movflags', '+faststart', stem + '-preview.mp4'], False),
+        ]
+        procs = [(subprocess.Popen(cmd_, stdin=subprocess.PIPE), alpha) for cmd_, alpha in jobs]
         n = int(round(DURATION * fps))
         for i in range(n):
-            p.stdin.write(film.frame(i / fps).tobytes())
-        p.stdin.close(); p.wait()
-        print('wrote', out, n, 'frames')
+            f = film.frame(i / fps)
+            prev = over(f, PREVIEW_BG)
+            for p, alpha in procs:
+                p.stdin.write((f if alpha else prev).tobytes())
+        for p, _ in procs:
+            p.stdin.close(); p.wait()
+        print('wrote', stem + '.{mov,webm,-preview.mp4}', n, 'frames')
