@@ -1,0 +1,23 @@
+.larphouse-void {
+    position: relative;
+    height: 100vh;
+    height: 100svh;
+    overflow: hidden;
+
+    // Своя плоскость наложения: ворота из Hero, увеличенные в 10 раз, иначе
+    // перекрывают секцию — у них z-index: 1 и огромный transform
+    z-index: 2;
+    isolation: isolate;
+
+    // Фон секции прозрачный: вокруг арки видно то, что лежит под ней (сейчас чёрный body).
+    // Два холста друг над другом: Void снизу, Larphouse сверху
+    &__canvas {
+        position: absolute;
+        inset: 0;
+
+        width: 100%;
+        height: 100%;
+        display: block;
+        pointer-events: none;
+    }
+}

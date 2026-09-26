@@ -6,6 +6,8 @@ and all noise is seeded once at build time, so any frame can be rendered alone.
   python3 larphouse.py still 4.9 out/final.png
   python3 larphouse.py sheet 0.5:3.0:0.25 out/sheet.png
   python3 larphouse.py render out/larphouse.mp4 [--fps 60]
+  python3 larphouse.py frames out/frames [--fps 60] [--light] [--no-corners]   # RGBA PNGs; --light: pale print for dark backgrounds
+  python3 larphouse.py corners out/corners [--light]   # growth sprite sheet per corner, for laying out at a page's edges
 """
 import sys, os, subprocess
 import numpy as np
@@ -23,6 +25,15 @@ PAPER = np.array([238, 229, 211], np.float32) / 255
 INK = np.array([33, 27, 30], np.float32) / 255      # warm overprint dark, never pure black
 RED = np.array([150, 28, 38], np.float32) / 255
 CAT_EYE = np.array([240, 234, 222], np.float32) / 255
+# --light: the print (letters, corner vines, the sword) in pale paper colour, for dark backgrounds.
+# The red plate (the roses) and the cat keep their colours.
+LIGHT = '--light' in sys.argv
+PRINT = np.array([238, 229, 211], np.float32) / 255 if LIGHT else INK
+# --no-corners: frames without the corner vines (a page lays them out at its own edges from
+# the `corners` sprite sheets instead)
+NO_CORNERS = '--no-corners' in sys.argv
+CORNER_STEPS = 40            # growth stages per corner in a sprite sheet
+CORNER_COLS = 8
 
 # ---------------------------------------------------------------- timeline (seconds)
 T_LETTERS = (0.5, 2.9)       # glyphs bleed in, left to right
@@ -509,6 +520,10 @@ class Cat:
             A[:] = newA
 
 
+def corner_progress(t, st, du, pw):
+    return 1 - (1 - span(t, st, st + du)) ** pw              # starts growing at once, settles slowly
+
+
 class Film:
     def __init__(self):
         self.lay = make_layers()
@@ -538,8 +553,9 @@ class Film:
         for i, g in enumerate(lay['glyphs']):
             s = a + STAGGER * (i + 1) + 0.05
             put(g, span(t, s, s + glyph_len))
-        for c, (st, du, pw) in zip(lay['corners'], T_CORNERS):
-            put(c, 1 - (1 - span(t, st, st + du)) ** pw)       # starts growing at once, settles slowly
+        if not NO_CORNERS:
+            for c, (st, du, pw) in zip(lay['corners'], T_CORNERS):
+                put(c, corner_progress(t, st, du, pw))
         put(lay['rose'], ease_io(span(t, *T_ROSE)))
         put(lay['rose_red'], ease_io(span(t, T_ROSE[0] + 0.3, T_ROSE[1] + 0.35)))
 
@@ -551,7 +567,7 @@ class Film:
         a_ink = np.clip(ink * dens, 0, 1)
         a_red = np.clip(red * dens * 0.9, 0, 1)
 
-        ink_rgb = np.broadcast_to(INK, (H, W, 3))
+        ink_rgb = np.broadcast_to(PRINT, (H, W, 3))
 
         # straight-alpha RGBA: ink printed over the red plate
         A = 1 - (1 - a_ink) * (1 - a_red)
@@ -593,6 +609,34 @@ if __name__ == '__main__':
     elif cmd == 'sheet':
         a, b, s = map(float, sys.argv[2].split(':'))
         sheet(film, list(np.arange(a, b + 1e-6, s)), sys.argv[3])
+    elif cmd == 'frames':
+        # RGBA PNG per frame (for the site: → AVIF)
+        out = sys.argv[2]
+        fps = int(sys.argv[sys.argv.index('--fps') + 1]) if '--fps' in sys.argv else 60
+        os.makedirs(out, exist_ok=True)
+        for i in range(int(round(DURATION * fps))):
+            Image.fromarray(film.frame(i / fps)).save(os.path.join(out, f'f_{i:04d}.png'), compress_level=1)
+    elif cmd == 'corners':
+        # One sprite sheet per corner: CORNER_STEPS growth stages (progress 0..1, even steps) in a
+        # CORNER_COLS-wide grid, each cell the corner's own box, RGBA in the print colour. Order and
+        # timing follow T_CORNERS: bottom right, bottom left, top right, top left. With the page's ink
+        # wear taken where the corner sits on the 1920×1080 page.
+        out = sys.argv[2]
+        os.makedirs(out, exist_ok=True)
+        names = ['bottom-right', 'bottom-left', 'top-right', 'top-left']
+        for k, c in enumerate(film.lay['corners']):
+            ch, cw = c.ink.shape
+            wear = film.wear[c.y:c.y + ch, c.x:c.x + cw]
+            rows = (CORNER_STEPS + CORNER_COLS - 1) // CORNER_COLS
+            sheet = np.zeros((rows * ch, CORNER_COLS * cw, 4), np.float32)
+            for j in range(CORNER_STEPS):
+                cov = c.coverage(j / (CORNER_STEPS - 1))
+                a = np.zeros((ch, cw), np.float32) if cov is None else np.clip(cov * wear, 0, 1)
+                r, q = divmod(j, CORNER_COLS)
+                cell = sheet[r * ch:(r + 1) * ch, q * cw:(q + 1) * cw]
+                cell[..., :3] = PRINT; cell[..., 3] = a
+            Image.fromarray((sheet * 255 + 0.5).astype(np.uint8)).save(os.path.join(out, f'corner-{names[k]}.png'))
+        print('corner cell', cw, 'x', ch, 'page margin', film.lay['corners'][3].x, 'steps', CORNER_STEPS, 'cols', CORNER_COLS)
     elif cmd == 'render':
         # one pass feeds three encoders: ProRes 4444 and VP9 keep the alpha, the MP4 is a preview on paper
         stem = sys.argv[2]

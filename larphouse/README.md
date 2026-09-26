@@ -28,7 +28,15 @@ pip install pillow numpy opencv-python-headless scipy imageio-ffmpeg
 python3 larphouse.py render larphouse --fps 60   # → larphouse.mov, .webm, -preview.mp4
 python3 larphouse.py still 4.99 larphouse-final.png
 python3 larphouse.py sheet 0.2:4.9:0.313 contact-sheet.png
+python3 larphouse.py frames out/frames --fps 30 --light --no-corners   # прозрачные RGBA PNG для сайта
+python3 larphouse.py corners out/corners --light                       # спрайты роста угловых лоз
 ```
+
+Для тёмного фона: `--light` печатает буквы, лозы и меч светлой краской цвета бумаги, красные розы
+и кот остаются как были. `--no-corners` убирает угловые лозы из кадров, а `corners` сохраняет их
+отдельно: для каждого угла сетка из 40 стадий роста (8 в ширину, ячейка 288×372), в порядке и с
+таймингами `T_CORNERS`. Так страница может ставить лозы в углы экрана при любом разрешении — см.
+компонент `../larphouse-void/react/LarphouseVoid.jsx`.
 
 Каждый кадр вычисляется только из времени `t`, случайный шум зафиксирован сидами, поэтому
 любой кадр можно отрендерить отдельно. Тайминги задаются константами `T_*` в начале `larphouse.py`.
