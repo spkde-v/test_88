@@ -15,13 +15,13 @@ import "./LarphouseVoid.scss";
 // а по URL их можно грузить по мере надобности.
 //  - Void: проход сквозь арку, 112 кадров (3.7 с). Идёт по скроллу. Обрезан на кадре, где дверь
 //    уже ушла за края: дальше в исходнике только пустота, и скроллить её незачем.
-//  - Larphouse: надпись и меч в светлой печати, 5 с (играется ускоренно), угловые лозы отдельно — см. CORNERS. Идёт сама, когда прокрутка Void закончилась:
+//  - Larphouse: надпись, удар рапиры и розы в светлой печати, 6.5 с (играется ускоренно), угловые лозы отдельно — см. CORNERS. Идёт сама, когда прокрутка Void закончилась:
 //    на это время скролл блокируется. При прокрутке назад она так же сама проигрывается задом наперёд
 const FRAME_W = 1920;
 const FRAME_H = 1080;
 const VOID = { count: 112, src: (i) => `/void/frames/f_${String(i).padStart(3, "0")}.avif` };
-const LARPHOUSE = { count: 150, fps: 30, src: (i) => `/larphouse/frames/f_${String(i).padStart(3, "0")}.avif` };
-const LARPHOUSE_DURATION = (LARPHOUSE.count - 1) / LARPHOUSE.fps;   // 5 с — длина исходной анимации
+const LARPHOUSE = { count: 195, fps: 30, src: (i) => `/larphouse/frames/f_${String(i).padStart(3, "0")}.avif` };
+const LARPHOUSE_DURATION = (LARPHOUSE.count - 1) / LARPHOUSE.fps;   // 6.5 с — длина исходной анимации
 // Во сколько раз быстрее исходника играть Larphouse (1.7 → ~2.9 с), пока страница заперта
 const LARPHOUSE_SPEED = 1.7;
 

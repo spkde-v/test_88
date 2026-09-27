@@ -1,11 +1,12 @@
-"""Larphouse — 5 s gothic title animation.
+"""Larphouse — 6.5 s gothic title animation: the word prints itself, a rapier slashes through it,
+the cut bleeds and roses grow out of the wound.
 
 Every frame is a pure function of time: frame(t) never depends on an earlier frame,
 and all noise is seeded once at build time, so any frame can be rendered alone.
 
   python3 larphouse.py still 4.9 out/final.png
   python3 larphouse.py sheet 0.5:3.0:0.25 out/sheet.png
-  python3 larphouse.py render out/larphouse.mp4 [--fps 60]
+  python3 larphouse.py render larphouse [--fps 60]    # larphouse.mov, .webm, -preview.mp4
   python3 larphouse.py frames out/frames [--fps 60] [--light] [--no-corners]   # RGBA PNGs; --light: pale print for dark backgrounds
   python3 larphouse.py corners out/corners [--light]   # growth sprite sheet per corner, for laying out at a page's edges
 """
@@ -19,12 +20,14 @@ from scipy.sparse.csgraph import dijkstra
 HERE = os.path.dirname(os.path.abspath(__file__))
 REF = os.path.join(HERE, 'refs')
 W, H = 1920, 1080
-DURATION = 5.0
+DURATION = 6.5
 
 PAPER = np.array([238, 229, 211], np.float32) / 255
 INK = np.array([33, 27, 30], np.float32) / 255      # warm overprint dark, never pure black
 RED = np.array([150, 28, 38], np.float32) / 255
 CAT_EYE = np.array([240, 234, 222], np.float32) / 255
+BLOOD = np.array([118, 12, 22], np.float32) / 255
+SHOW_CAT = False             # the cat sits this version out
 # --light: the print (letters, corner vines, the sword) in pale paper colour, for dark backgrounds.
 # The red plate (the roses) and the cat keep their colours.
 LIGHT = '--light' in sys.argv
@@ -42,7 +45,6 @@ STAGGER = 0.13
 # corner vines: (start, duration, ease-out power) per corner — deliberately unequal so they
 # don't grow in lockstep. Order: bottom right, bottom left, top right, top left.
 T_CORNERS = [(0.25, 4.0, 1.3), (0.6, 3.5, 1.7), (0.0, 3.7, 1.5), (0.45, 4.3, 1.9)]
-T_ROSE = (2.2, 3.8)
 # the cat: trots in from the right, sees the blooming rose, bristles, jumps, bolts back out
 T_CAT_IN = (1.0, 2.85)       # trot from off-screen right to its stopping mark
 T_CAT_BRISTLE = (3.0, 3.2)   # fur stands up
@@ -520,6 +522,452 @@ class Cat:
             A[:] = newA
 
 
+# ---------------------------------------------------------------- the slash
+# A rapier (one of the crossed swords) appears above the end of the word, winds up, dives onto the
+# cut line and runs through the whole word tip-first, right to left. The word splits along a
+# slightly jagged line: the upper half slides down-left along the cut and lifts a little. Both cut
+# edges bleed (a red rim, beads, drips down the strokes), and from the wound thorned stems grow
+# along the cut and the beads open into roses, right to left, following the blow.
+CUT_C = (945.0, 612.0)           # a point on the cut (page px)
+CUT_ANG = np.radians(5.0)        # the cut rises to the right
+CUT_U = np.array([np.cos(CUT_ANG), -np.sin(CUT_ANG)])      # along the cut, to the right
+CUT_N = np.array([-np.sin(CUT_ANG), -np.cos(CUT_ANG)])     # normal, pointing up
+SLIDE = -17.0 * CUT_U + 3.2 * CUT_N                         # where the upper half ends up
+GAP = 2.2                        # px of clean gap at the cut
+
+T_SWORD_IN = (2.45, 2.95)        # the rapier bleeds in above the end of the word
+T_WINDUP = (2.95, 3.10)
+T_SWOOP = (3.10, 3.17)           # dives onto the cut line
+T_CUT = (3.17, 3.405)            # tip runs along the cut from X_ENTER to X_EXIT (hilt fully off screen)
+X_ENTER, X_EXIT = 1760.0, -760.0
+T_SHAKE = 0.34                   # how long the frame shakes after the blade enters
+SWORD_LEN = 680
+ROSE_T0, ROSE_STEP, ROSE_OPEN = 4.15, 0.3, 0.7
+
+
+def cut_y(x):
+    return CUT_C[1] - (x - CUT_C[0]) * np.tan(CUT_ANG)
+
+
+def t_pass(x):
+    """When the tip passes page x on the cut."""
+    return T_CUT[0] + (X_ENTER - x) / (X_ENTER - X_EXIT) * (T_CUT[1] - T_CUT[0])
+
+
+def ease_out_back(x, k=1.4):
+    x = np.clip(x, 0, 1)
+    return 1 + (k + 1) * (x - 1) ** 3 + k * (x - 1) ** 2
+
+
+def bezier(P, u):
+    P = np.asarray(P, np.float64)
+    return (1 - u) ** 3 * P[0] + 3 * (1 - u) ** 2 * u * P[1] + 3 * (1 - u) * u * u * P[2] + u ** 3 * P[3]
+
+
+def rapier_sprite():
+    """The rapier whose point is top right in crossed-swords.png, laid horizontal, point to +x.
+    Returns ink (h, w) and the pixel column of the point."""
+    sw = ink_from(os.path.join(REF, 'crossed-swords.png'), lo=0.15, hi=0.8)
+    h, w = sw.shape
+    yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+    tip, pom = np.array([845., 18.]), np.array([55., 875.])
+    d = pom - tip
+    Ln = np.linalg.norm(d)
+    u = d / Ln
+    n = np.array([-u[1], u[0]])
+    s = ((xx - tip[0]) * u[0] + (yy - tip[1]) * u[1]) / Ln
+    q = (xx - tip[0]) * n[0] + (yy - tip[1]) * n[1]
+    halfw = np.where(s < 0.6, 10 + 8 * s, 175)                      # narrow on the blade: no crossing stub
+    one = sw * ((np.abs(q) < halfw) & (s > -0.02) & (s < 1.05))
+    # rotate so the point is to the right, on a canvas big enough for any angle
+    ang = np.degrees(np.arctan2(-(tip - pom)[1], (tip - pom)[0]))   # point direction, screen up = +
+    M = cv2.getRotationMatrix2D((w / 2, h / 2), -ang, 1.0)
+    big = int(np.hypot(h, w))
+    M[0, 2] += big / 2 - w / 2; M[1, 2] += big / 2 - h / 2
+    r = cv2.warpAffine(one.astype(np.float32), M, (big, big), flags=cv2.INTER_CUBIC)
+    r = crop(np.clip(r, 0, 1), pad=4)
+    r = fit(r, width=SWORD_LEN)
+    return r
+
+
+def rose_sprite():
+    """The front-facing rose from rose-sword.png: ink outline, red petal fill, silhouette."""
+    rs = ink_from(os.path.join(REF, 'rose-sword.png'), lo=0.1, hi=0.78)
+    closed = cv2.morphologyEx((rs > 0.35).astype(np.uint8), cv2.MORPH_CLOSE,
+                              cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15)))
+    flood = closed.copy()
+    cv2.floodFill(flood, np.zeros((flood.shape[0] + 2, flood.shape[1] + 2), np.uint8), (0, 0), 1)
+    enclosed = ((flood == 0) | (closed > 0)) & (rs < 0.35)
+    bx, by, br = 178, 725, 80
+    yy, xx = np.mgrid[0:rs.shape[0], 0:rs.shape[1]]
+    inside = enclosed & (np.hypot(xx - bx, yy - by) < br)
+    sil = cv2.dilate(inside.astype(np.uint8), np.ones((9, 9), np.uint8)).astype(np.float32)
+    sil = cv2.morphologyEx(sil, cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8))
+    r = int(br * 1.2)
+    sl = np.s_[by - r:by + r, bx - r:bx + r]
+    ink = (rs * sil)[sl]
+    red = (cv2.GaussianBlur(inside.astype(np.float32), (0, 0), 1.0) * (1 - rs))[sl]
+    sil = cv2.GaussianBlur(sil[sl], (0, 0), 1.0)
+    return ink.astype(np.float32), red.astype(np.float32), sil.astype(np.float32)
+
+
+class Slash:
+    def __init__(self, film):
+        self.film = film
+        A = film.lay['A']
+        x0, y0, x1, y1 = A['word_box']
+        self.box = (int(x0) - 60, int(y0) - 40, int(x1) + 60, int(y1) + 60)
+        bx0, by0, bx1, by1 = self.box
+        yy, xx = np.mgrid[by0:by1, bx0:bx1].astype(np.float32)
+        self.xx, self.yy = xx, yy
+        # the cut: signed distance to a slightly jagged line (positive = above)
+        s = (xx - CUT_C[0]) * CUT_U[0] + (yy - CUT_C[1]) * CUT_U[1]
+        d = (xx - CUT_C[0]) * CUT_N[0] + (yy - CUT_C[1]) * CUT_N[1]
+        rng = np.random.default_rng(71)
+        jag1 = np.interp(s, np.arange(-1200, 1200, 7), rng.normal(0, 0.9, len(range(-1200, 1200, 7))))
+        jag2 = np.interp(s, np.arange(-1200, 1200, 37), rng.normal(0, 1.4, len(range(-1200, 1200, 37))))
+        self.d = d + jag1 + jag2
+        self.s = s
+        self.sword = rapier_sprite()
+        self.sword_field = rank_noise(self.sword.shape, 5, 90)
+        self.sword_stain = cv2.GaussianBlur(self.sword, (0, 0), 6) * 0.5
+        self.rose_ink, self.rose_red, self.rose_sil = rose_sprite()
+        self.title_final = None                                         # filled on first use
+        self.rng = np.random.default_rng(72)
+
+    # -- sites along the cut (from the finished letters) ---------------------------------
+    def sites(self, title):
+        """Where the cut crosses ink: bead sites for the blood, rose sites among them."""
+        bx0, by0, bx1, by1 = self.box
+        xs = np.arange(bx0 + 10, bx1 - 10, 1.0)
+        ys = cut_y(xs)
+        on = title[np.clip(ys.astype(int), 0, H - 1), xs.astype(int)] > 0.5
+        runs = []
+        start = None
+        for x, o in zip(xs, on):
+            if o and start is None:
+                start = x
+            if not o and start is not None:
+                if x - start > 6:
+                    runs.append((start, x))
+                start = None
+        rng = np.random.default_rng(73)
+        beads = []
+        for a, b in runs:
+            n = 1 + int((b - a) // 60)
+            for k in range(n):
+                x = a + (b - a) * (k + 0.5) / n + rng.uniform(-0.2, 0.2) * (b - a) / n
+                beads.append(dict(x=float(x), r=float(rng.uniform(3.5, 7.0)),
+                                  top=bool(rng.random() < 0.45), drip=float(rng.uniform(35, 120)) if rng.random() < 0.7 else 0.0,
+                                  delay=float(rng.uniform(0.15, 0.5))))
+        # roses: spread along the word, at bead sites
+        xs_b = np.array([b['x'] for b in beads])
+        targets = np.array([1575.0, 1205.0, 830.0, 430.0])
+        roses = []
+        used = set()
+        for k, tx in enumerate(targets):
+            i = int(np.argmin(np.abs(xs_b - tx) + [1e9 if j in used else 0 for j in range(len(xs_b))]))
+            used.add(i)
+            roses.append(dict(x=float(xs_b[i]), size=float((0.7, 0.6, 0.76, 0.66)[k]),
+                              rot=float(rng.uniform(-40, 40)), flip=bool(k % 2),
+                              dx=float((34, -30, 40, -36)[k]), off=float((52, -50, 58, -56)[k]),
+                              t0=ROSE_T0 + k * ROSE_STEP))
+        self.beads, self.roses = beads, roses
+
+    # -- the rapier ----------------------------------------------------------------------------
+    def tip_pose(self, t):
+        """Point position and pointing direction (unit) of the rapier, or None when not shown."""
+        hover_tip = np.array([1700.0, 372.0])
+        hover_dir = np.array([-0.46, 0.89])
+        wind_tip = np.array([1765.0, 296.0])
+        wind_dir = np.array([-0.28, 0.96])
+        if t < T_SWORD_IN[0] or t > T_CUT[1] + 0.02:
+            return None
+        if t < T_WINDUP[0]:
+            bob = 4 * np.sin(2 * np.pi * (t - T_SWORD_IN[0]) / 0.9)
+            return hover_tip + np.array([0, bob]), hover_dir
+        if t < T_SWOOP[0]:
+            u = ease_io(span(t, *T_WINDUP))
+            dvec = hover_dir + (wind_dir - hover_dir) * u
+            return hover_tip + (wind_tip - hover_tip) * u, dvec / np.linalg.norm(dvec)
+        if t < T_CUT[0]:
+            u = span(t, *T_SWOOP) ** 1.6
+            P = [wind_tip, (1795, 470), (1880, cut_y(1880)), (X_ENTER, cut_y(X_ENTER))]
+            p = bezier(P, u)
+            q = bezier(P, min(1.0, u + 0.02)) - bezier(P, max(0.0, u - 0.02))
+            return p, q / (np.linalg.norm(q) + 1e-9)
+        u = span(t, *T_CUT)
+        x = X_ENTER + (X_EXIT - X_ENTER) * u
+        return np.array([x, cut_y(x)]), -CUT_U
+
+    def draw_sword(self, t, fps, ink):
+        """Adds the rapier's coverage to `ink` (full page). Motion blur: many sub-frames across
+        the frame's shutter, each warped only into the box the blade occupies."""
+        fast = T_SWOOP[0] <= t <= T_CUT[1] + 0.02
+        n = 48 if fast else 1
+        sh, sw_ = self.sword.shape
+        if t < T_WINDUP[0]:
+            p = span(t, *T_SWORD_IN)
+            q = np.clip((p * 1.4 - self.sword_field) / 0.4, 0, 1)
+            spr = (self.sword_stain * (1 - q) + self.sword * q) * np.clip(p * 2.5, 0, 1)
+        else:
+            spr = self.sword
+        acc = np.zeros((H, W), np.float32)
+        corners = np.array([[0, 0, 1], [sw_, 0, 1], [0, sh, 1], [sw_, sh, 1]], np.float64)
+        drawn = 0
+        for k in range(n):
+            ts = t + ((k + 0.5) / n - 0.5) / fps if n > 1 else t
+            pose = self.tip_pose(ts)
+            if pose is None:
+                continue
+            tip, dvec = pose
+            ang = np.degrees(np.arctan2(-dvec[1], dvec[0]))
+            M = cv2.getRotationMatrix2D((sw_ - 1.0, sh / 2), ang, 1.0)
+            M[0, 2] += tip[0] - (sw_ - 1.0)
+            M[1, 2] += tip[1] - sh / 2
+            pc = corners @ M.T
+            x0, y0 = int(max(0, np.floor(pc[:, 0].min()) - 2)), int(max(0, np.floor(pc[:, 1].min()) - 2))
+            x1, y1 = int(min(W, np.ceil(pc[:, 0].max()) + 2)), int(min(H, np.ceil(pc[:, 1].max()) + 2))
+            drawn += 1
+            if x1 <= x0 or y1 <= y0:
+                continue
+            M[0, 2] -= x0; M[1, 2] -= y0
+            acc[y0:y1, x0:x1] += cv2.warpAffine(spr, M, (x1 - x0, y1 - y0), flags=cv2.INTER_LINEAR)
+        if drawn:
+            np.maximum(ink, np.clip(acc / n, 0, 1), out=ink)
+
+    # -- the cut, the blood ------------------------------------------------------------------
+    def sep(self, t):
+        """Separation 0..1(+overshoot) per box column, following the blade."""
+        tp = t_pass(self.xx[0])
+        return ease_out_back((t - tp - 0.02) / 0.38, 1.2)
+
+    def split(self, title, t):
+        """Returns the title with its upper half slid along the cut (full page array), plus the
+        per-pixel displacement used, so the blood on the upper edge can ride along."""
+        bx0, by0, bx1, by1 = self.box
+        sub = title[by0:by1, bx0:bx1]
+        passed = (t - t_pass(self.xx) > 0).astype(np.float32)
+        sp = self.sep(t)[None, :] * passed
+        dx, dy = SLIDE[0] * sp, SLIDE[1] * sp
+        mx, my = self.xx - dx - bx0, self.yy - dy - by0
+        moved = cv2.remap(sub, mx.astype(np.float32), my.astype(np.float32), cv2.INTER_LINEAR)
+        d_src = cv2.remap(self.d, mx.astype(np.float32), my.astype(np.float32), cv2.INTER_LINEAR,
+                          borderMode=cv2.BORDER_REPLICATE)
+        # the gap opens where the blade has been: a clean slice, anti-aliased
+        g = GAP * passed
+        top = moved * np.clip(d_src - g / 2 + 0.5, 0, 1)
+        bot = sub * np.clip(-self.d - g / 2 + 0.5, 0, 1)
+        out = title.copy()
+        out[by0:by1, bx0:bx1] = np.maximum(top, bot) if t > T_CUT[0] else sub
+        return out, (mx, my)
+
+    def blood(self, title_static, t, maps):
+        """Blood coverage (full page). Built in each half's own coordinates, the upper half's then
+        carried by the same slide as the letters."""
+        bx0, by0, bx1, by1 = self.box
+        sub = title_static[by0:by1, bx0:bx1]
+        tp = t_pass(self.xx)
+        grow = smooth((t - tp - 0.12) / 0.45)
+        d = self.d
+        # rim: along both edges, inside the letters
+        w = 0.5 + 5.0 * grow
+        rim_top = sub * (d > 0) * np.exp(-np.clip(d, 0, None) / np.maximum(w, 1e-3)) * (grow > 0)
+        rim_bot = sub * (d < 0) * np.exp(-np.clip(-d, 0, None) / np.maximum(w, 1e-3)) * (grow > 0)
+        top = rim_top * 0.95
+        bot = rim_bot * 0.95
+        for b in self.beads:
+            tb = t_pass(b['x']) + b['delay']
+            g = smooth((t - tb) / 0.35)
+            if g <= 0:
+                continue
+            x = b['x']
+            yl = cut_y(x)
+            r = b['r'] * (0.3 + 0.7 * g)
+            if b['top']:
+                # a drop hanging from the upper edge, swelling
+                cy = yl - 1.5 + r * 0.9
+                blob = np.clip(r - np.hypot((self.xx - x) / 0.85, (self.yy - cy) / 1.3) + 0.5, 0, 1)
+                top = np.maximum(top, blob * (np.abs(self.xx - x) < r + 3))
+            else:
+                cy = yl + 1.0 + r * 0.6
+                blob = np.clip(r - np.hypot(self.xx - x, self.yy - cy) + 0.5, 0, 1)
+                bot = np.maximum(bot, blob * (sub > 0.3))
+                if b['drip'] > 0:
+                    L_ = b['drip'] * smooth((t - tb - 0.25) / 1.3)
+                    if L_ > 0.5:
+                        wd = 1.6 + 1.3 * b['r'] / 5
+                        col = np.clip(wd - np.abs(self.xx - x) + 0.5, 0, 1)
+                        run = col * (self.yy > cy) * (self.yy < cy + L_)
+                        end = np.clip(wd * 1.35 - np.hypot(self.xx - x, self.yy - (cy + L_)) + 0.5, 0, 1)
+                        bot = np.maximum(bot, np.maximum(run, end) * (sub > 0.3))
+        mx, my = maps
+        top_moved = cv2.remap(top.astype(np.float32), mx.astype(np.float32), my.astype(np.float32), cv2.INTER_LINEAR)
+        out = np.zeros((H, W), np.float32)
+        out[by0:by1, bx0:bx1] = np.maximum(top_moved, bot)
+        return out
+
+    # -- stems and roses -----------------------------------------------------------------------
+    def stems(self, t, deco, halo):
+        """For each rose: a thorned stem that pushes out of the gap and curls to where the rose
+        opens, and two short tendrils running along the cut. Drawn into `deco` (uint8) with a
+        clearing `halo` (uint8) so they read over the letters."""
+        S = 16
+
+        def draw_path(pts, grow, thick, seed, leaves=True):
+            n = int(len(pts) * grow)
+            if n < 2:
+                return
+            pts = pts[:n]
+            for j in range(0, n - 1, 3):
+                seg = pts[j:min(n, j + 4)]
+                taper = min(1.0, (n - j) / 18)
+                th = max(1, int(round(thick * taper)))
+                P = np.round(seg * S).astype(np.int32)
+                cv2.polylines(halo, [P], False, 255, th + 4, cv2.LINE_AA, 4)
+                cv2.polylines(deco, [P], False, 255, th, cv2.LINE_AA, 4)
+            for j in range(9, n - 4, 11):
+                p0 = pts[j]
+                tang = pts[j + 1] - pts[j - 1]
+                tang = tang / (np.linalg.norm(tang) + 1e-9)
+                side = 1 if (j // 11 + seed) % 2 else -1
+                nrm = np.array([-tang[1], tang[0]]) * side
+                sz = 5.5 * min(1.0, (n - j) / 20)
+                if sz < 1:
+                    continue
+                tri = np.array([p0 - tang * sz * 0.45, p0 + tang * sz * 0.45, p0 + nrm * sz * 1.15 - tang * sz * 0.8])
+                P = np.round(tri * S).astype(np.int32)
+                cv2.fillPoly(halo, [P], 255, cv2.LINE_AA, 4)
+                cv2.fillPoly(deco, [P], 255, cv2.LINE_AA, 4)
+                if leaves and (j // 11 + seed) % 3 == 1:
+                    ls = 13 * min(1.0, (n - j) / 26)
+                    if ls > 2:
+                        base = p0 + nrm * 2
+                        tipp = base + (nrm * 0.85 - tang * 0.5) * ls * 1.7
+                        mid = (base + tipp) / 2
+                        sd = np.array([-(tipp - base)[1], (tipp - base)[0]])
+                        sd = sd / (np.linalg.norm(sd) + 1e-9) * ls * 0.42
+                        curve = np.array([bezier([base, mid + sd, mid + sd, tipp], u) for u in np.linspace(0, 1, 8)] +
+                                         [bezier([tipp, mid - sd, mid - sd, base], u) for u in np.linspace(0, 1, 8)])
+                        P = np.round(curve * S).astype(np.int32)
+                        cv2.fillPoly(halo, [P], 255, cv2.LINE_AA, 4)
+                        cv2.fillPoly(deco, [P], 255, cv2.LINE_AA, 4)
+                        cv2.line(deco, tuple(np.round(base * S).astype(int)), tuple(np.round(tipp * S).astype(int)),
+                                 0, 1, cv2.LINE_AA, 4)                    # the midrib, in paper
+
+        for k, rz in enumerate(self.roses):
+            x = rz['x']
+            base = np.array([x, cut_y(x)])
+            end = np.array([x + rz['dx'], cut_y(x) - rz['off']])
+            up = -1 if rz['off'] > 0 else 1                  # screen y direction toward the rose
+            c1 = base + np.array([-rz['dx'] * 0.6, up * 30])
+            c2 = end + np.array([rz['dx'] * 0.5, -up * 26])
+            stem = np.array([bezier([base, c1, c2, end], u) for u in np.linspace(0, 1, 60)])
+            g = smooth((t - (rz['t0'] - 0.5)) / 0.55)
+            if g > 0:
+                draw_path(stem, g, 3, k)
+            # tendrils along the cut, both ways, a little after the stem
+            for dirn, L_, sd in ((1, 95 + 25 * (k % 2), 2), (-1, 120 - 20 * (k % 2), 3)):
+                g2 = smooth((t - (rz['t0'] - 0.3)) / 0.8)
+                if g2 <= 0:
+                    continue
+                xs = x + dirn * np.arange(0, L_, 2.0)
+                off = 5 * np.sin((xs - x) / 17 + k + sd) * np.minimum(1, np.abs(xs - x) / 25)
+                pts = np.stack([xs + CUT_N[0] * off, cut_y(xs) + CUT_N[1] * off], 1)
+                draw_path(pts, g2, 2, k + sd, leaves=True)
+
+    def draw_roses(self, t, deco, red, halo):
+        for rz in self.roses:
+            u = (t - rz['t0']) / ROSE_OPEN
+            if u <= 0:
+                continue
+            x = rz['x'] + rz['dx']
+            y = cut_y(rz['x']) - rz['off']            # off > 0: above the cut
+            # a red bud swells first; then the rose opens out of it with a little twist
+            bud = smooth(u / 0.3) * (1 - smooth((u - 0.45) / 0.3))
+            if bud > 0:
+                rb = 3 + 8 * smooth(u / 0.3)
+                yy_, xx_ = np.ogrid[int(y - 20):int(y + 21), int(x - 20):int(x + 21)]
+                disc = np.clip(rb - np.hypot(xx_ - x, (yy_ - y) / 1.15) + 0.5, 0, 1) * bud
+                sl_ = np.s_[int(y - 20):int(y + 21), int(x - 20):int(x + 21)]
+                np.maximum(red[sl_], disc, out=red[sl_])
+                np.maximum(halo[sl_], np.clip(disc * 1.5, 0, 1), out=halo[sl_])
+                ring = np.clip(1.2 - np.abs(np.hypot(xx_ - x, (yy_ - y) / 1.15) - rb), 0, 1) * bud
+                np.maximum(deco[sl_], ring, out=deco[sl_])
+            v = (u - 0.25) / 0.75
+            if v <= 0:
+                continue
+            open_ = ease_out_back(v, 1.1)
+            sc = rz['size'] * (0.3 + 0.7 * open_)
+            rot = rz['rot'] + 55 * (1 - smooth(v))
+            ink, rd, sil = self.rose_ink, self.rose_red, self.rose_sil
+            if rz['flip']:
+                ink, rd, sil = ink[:, ::-1], rd[:, ::-1], sil[:, ::-1]
+            h, w = ink.shape
+            M = cv2.getRotationMatrix2D((w / 2, h / 2), rot, sc)
+            M[0, 2] += x - w / 2
+            M[1, 2] += y - h / 2
+            R = int(max(h, w) * sc) + 8
+            x0, y0 = int(x) - R, int(y) - R
+            M[0, 2] -= x0; M[1, 2] -= y0
+            reveal = smooth(v * 4)
+            ci = cv2.warpAffine(ink, M, (2 * R, 2 * R), flags=cv2.INTER_LINEAR) * reveal
+            cr = cv2.warpAffine(rd, M, (2 * R, 2 * R), flags=cv2.INTER_LINEAR) * smooth(v * 3)
+            cs = cv2.warpAffine(sil, M, (2 * R, 2 * R), flags=cv2.INTER_LINEAR) * reveal
+            hal = cv2.dilate(cs, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7)))
+            ys, xs_ = slice(max(0, y0), min(H, y0 + 2 * R)), slice(max(0, x0), min(W, x0 + 2 * R))
+            sy, sx = slice(ys.start - y0, ys.stop - y0), slice(xs_.start - x0, xs_.stop - x0)
+            np.maximum(deco[ys, xs_], ci[sy, sx], out=deco[ys, xs_])
+            np.maximum(red[ys, xs_], cr[sy, sx], out=red[ys, xs_])
+            np.maximum(halo[ys, xs_], hal[sy, sx], out=halo[ys, xs_])
+            # the rose's own paper (between its lines) hides what is under it
+            np.maximum(halo[ys, xs_], cs[sy, sx], out=halo[ys, xs_])
+
+    def trail(self, t):
+        """The blow's trace along the cut: a dark swoosh that thins to a sharp point at the blade
+        and a bright slit at its core, both dying away within a quarter second. Returns
+        (smear coverage, clearing) for the full page, or None."""
+        if t < T_CUT[0] or t > T_CUT[1] + 0.35:
+            return None
+        if not hasattr(self, 'full_d'):
+            yy, xx = np.mgrid[0:H, 0:W].astype(np.float32)
+            self.full_d = (xx - CUT_C[0]) * CUT_N[0] + (yy - CUT_C[1]) * CUT_N[1]
+            self.full_x = xx
+            self.band = np.abs(self.full_d) < 70
+        age = t - t_pass(self.full_x)
+        live = (age > 0) & self.band
+        w = 34.0 * np.clip(age / 0.05, 0, 1) ** 0.7 * np.exp(-np.clip(age, 0, None) / 0.14)
+        k = np.exp(-np.clip(age, 0, None) / 0.11)
+        smear = np.clip(1 - np.abs(self.full_d + 0.35 * w) / np.maximum(w, 1e-3), 0, 1) ** 1.2 * k * 0.8 * live
+        core = np.clip(1.0 + 0.16 * w - np.abs(self.full_d), 0, 1) * np.clip(k * 1.5, 0, 1) * live
+        return smear.astype(np.float32), core.astype(np.float32)
+
+    def shake(self, t):
+        u = (t - T_CUT[0]) / T_SHAKE
+        if u < 0 or u > 1:
+            return 0.0, 0.0
+        a = 7.0 * (1 - u) ** 2
+        return a * np.sin(2 * np.pi * 23 * u), a * 0.6 * np.cos(2 * np.pi * 17 * u + 0.7)
+
+    def chips(self, t, ink):
+        """Flecks of ink knocked out of the cut, flying the way of the blow and falling (uint8)."""
+        rng = np.random.default_rng(74)
+        for k in range(26):
+            x0 = rng.uniform(250, 1700)
+            tp = t_pass(x0)
+            u = t - tp
+            if u < 0 or u > 0.9:
+                continue
+            vx = -rng.uniform(250, 700)
+            vy = rng.uniform(-260, 60)
+            px = x0 + vx * u
+            py = cut_y(x0) + vy * u + 900 * u * u
+            r = rng.uniform(1.2, 3.2) * (1 - u / 0.9)
+            if r < 0.4:
+                continue
+            cv2.circle(ink, (int(px * 16), int(py * 16)), int(r * 16), 255, -1, cv2.LINE_AA, 4)
+
+
 def corner_progress(t, st, du, pw):
     return 1 - (1 - span(t, st, st + du)) ** pw              # starts growing at once, settles slowly
 
@@ -528,9 +976,32 @@ class Film:
     def __init__(self):
         self.lay = make_layers()
         _, self.wear, self.grain = make_paper()
-        self.cat = Cat()
+        self.cat = Cat() if SHOW_CAT else None
         A = self.lay['A']
         self.baseline = A['baseline']
+        self.slash = Slash(self)
+        self.slash.sites(self.title(DURATION))
+
+    def title(self, t):
+        """Coverage of the printed word (the capital and the lowercase) at time t."""
+        out = np.zeros((H, W), np.float32)
+        lay = self.lay
+        a, b = T_LETTERS
+        glyph_len = (b - a) - STAGGER * len(lay['glyphs'])
+        parts = [(lay['L'], span(t, a, a + glyph_len + T_L_EXTRA))]
+        for i, g in enumerate(lay['glyphs']):
+            s = a + STAGGER * (i + 1) + 0.05
+            parts.append((g, span(t, s, s + glyph_len)))
+        for layer, p in parts:
+            c = layer.coverage(p)
+            if c is None:
+                continue
+            h, w = c.shape
+            sl = out[layer.y:layer.y + h, layer.x:layer.x + w]
+            np.maximum(sl, c[:sl.shape[0], :sl.shape[1]], out=sl)
+        return out
+
+    fps = 60
 
     def frame(self, t):
         ink = np.zeros((H, W), np.float32)
@@ -547,33 +1018,67 @@ class Film:
             sl = tgt[y:y + h, x:x + w]
             np.maximum(sl, c[:sl.shape[0], :sl.shape[1]], out=sl)
 
-        a, b = T_LETTERS
-        glyph_len = (b - a) - STAGGER * len(lay['glyphs'])
-        put(lay['L'], span(t, a, a + glyph_len + T_L_EXTRA))
-        for i, g in enumerate(lay['glyphs']):
-            s = a + STAGGER * (i + 1) + 0.05
-            put(g, span(t, s, s + glyph_len))
         if not NO_CORNERS:
             for c, (st, du, pw) in zip(lay['corners'], T_CORNERS):
                 put(c, corner_progress(t, st, du, pw))
-        put(lay['rose'], ease_io(span(t, *T_ROSE)))
-        put(lay['rose_red'], ease_io(span(t, T_ROSE[0] + 0.3, T_ROSE[1] + 0.35)))
+        sl = self.slash
+        title = self.title(t)
+        blood = np.zeros((H, W), np.float32)
+        if t > T_CUT[0]:
+            split, maps = sl.split(title, t)
+            blood = sl.blood(title, t, maps)
+            title = split
+        np.maximum(ink, title, out=ink)
+        chips = np.zeros((H, W), np.uint8)
+        sl.chips(t, chips)
+        np.maximum(ink, chips.astype(np.float32) / 255, out=ink)
+        deco8 = np.zeros((H, W), np.uint8)
+        halo8 = np.zeros((H, W), np.uint8)
+        sl.stems(t, deco8, halo8)
+        deco = deco8.astype(np.float32) / 255
+        halo = halo8.astype(np.float32) / 255
+        rose_red = np.zeros((H, W), np.float32)
+        sl.draw_roses(t, deco, rose_red, halo)
+        sword = np.zeros((H, W), np.float32)
+        sl.draw_sword(t, self.fps, sword)
 
         # breathing grain: three fixed textures cross-faded slowly (no per-frame noise crawl)
         ph = t * 0.6
         wts = [0.5 + 0.5 * np.cos(2 * np.pi * (ph - j / 3)) for j in range(3)]
         gr = sum(w_ * g_ for w_, g_ in zip(wts, self.grain)) / sum(wts)
         dens = self.wear * (1 + 0.05 * gr)
-        a_ink = np.clip(ink * dens, 0, 1)
-        a_red = np.clip(red * dens * 0.9, 0, 1)
+        # premultiplied layers, bottom to top: the print, the blood on its cut edges, a clearing
+        # around the stems and roses, the red of the petals, the stems' and roses' ink, the rapier
+        P = np.zeros((H, W, 3), np.float32)
+        A = np.zeros((H, W), np.float32)
 
-        ink_rgb = np.broadcast_to(PRINT, (H, W, 3))
+        def lay_over(cov, color):
+            nonlocal P, A
+            c = np.clip(cov, 0, 1)
+            P = color * c[..., None] + P * (1 - c[..., None])
+            A = c + A * (1 - c)
 
-        # straight-alpha RGBA: ink printed over the red plate
-        A = 1 - (1 - a_ink) * (1 - a_red)
-        rgb = (RED * (a_red * (1 - a_ink))[..., None] + ink_rgb * a_ink[..., None]) / np.maximum(A, 1e-6)[..., None]
-        # the cat is a solid cut-out on top of the print
-        self.cat.draw(t, rgb, A)
+        lay_over(ink * dens, PRINT)
+        lay_over(blood * (0.9 + 0.1 * dens), BLOOD)
+        h_ = np.clip(halo, 0, 1)
+        P *= (1 - h_[..., None]); A *= (1 - h_)
+        lay_over(rose_red * dens * 0.95, RED)
+        lay_over(deco * dens, PRINT)
+        tr = sl.trail(t)
+        if tr is not None:
+            smear, core = tr
+            lay_over(smear, PRINT)
+            P *= (1 - core[..., None]); A *= (1 - core)
+        lay_over(sword, PRINT)
+        rgb = P / np.maximum(A, 1e-6)[..., None]
+        if self.cat is not None:
+            self.cat.draw(t, rgb, A)
+        dx, dy = sl.shake(t)
+        if dx or dy:
+            M = np.float32([[1, 0, dx], [0, 1, dy]])
+            rgb = cv2.warpAffine(rgb * A[..., None], M, (W, H), flags=cv2.INTER_LINEAR)
+            A = cv2.warpAffine(A, M, (W, H), flags=cv2.INTER_LINEAR)
+            rgb = rgb / np.maximum(A, 1e-6)[..., None]
         out = np.dstack([np.clip(rgb, 0, 1), A])
         return (out * 255 + 0.5).astype(np.uint8)
 
@@ -614,6 +1119,7 @@ if __name__ == '__main__':
         out = sys.argv[2]
         fps = int(sys.argv[sys.argv.index('--fps') + 1]) if '--fps' in sys.argv else 60
         os.makedirs(out, exist_ok=True)
+        film.fps = fps
         for i in range(int(round(DURATION * fps))):
             Image.fromarray(film.frame(i / fps)).save(os.path.join(out, f'f_{i:04d}.png'), compress_level=1)
     elif cmd == 'corners':
@@ -654,6 +1160,7 @@ if __name__ == '__main__':
         ]
         procs = [(subprocess.Popen(cmd_, stdin=subprocess.PIPE), alpha) for cmd_, alpha in jobs]
         n = int(round(DURATION * fps))
+        film.fps = fps
         for i in range(n):
             f = film.frame(i / fps)
             prev = over(f, PREVIEW_BG)
