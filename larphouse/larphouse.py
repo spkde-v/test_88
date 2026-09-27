@@ -601,6 +601,10 @@ T_WINDUP = (2.95, 3.10)
 T_SWOOP = (3.10, 3.17)           # dives onto the cut line
 T_CUT = (3.17, 3.405)            # tip runs along the cut from X_ENTER to X_EXIT (hilt fully off screen)
 X_ENTER, X_EXIT = 1760.0, -760.0
+# after the cut the rapier swings back in a wide arc over the top (its point sweeping from left,
+# through up, to right) and comes to rest level above the word, centred on the screen
+T_RETURN = (3.47, 4.4)
+REST_TIP = np.array([1300.0, 318.0])        # point of the resting rapier (its middle is x = 960)
 T_SHAKE = 0.34                   # how long the frame shakes after the blade enters
 SWORD_LEN = 680
 ROSE_T0, ROSE_STEP, ROSE_OPEN = 4.15, 0.3, 0.7
@@ -742,7 +746,16 @@ class Slash:
         hover_dir = np.array([-0.46, 0.89])
         wind_tip = np.array([1765.0, 296.0])
         wind_dir = np.array([-0.28, 0.96])
-        if t < T_SWORD_IN[0] or t > T_CUT[1] + 0.02:
+        if t < T_SWORD_IN[0]:
+            return None
+        if t >= T_RETURN[0]:
+            u = span(t, *T_RETURN)
+            e = ease_out_back(u, 0.9)                     # arrives with a slight overshoot and settle
+            P = [(X_EXIT, cut_y(X_EXIT)), (-420, 60), (560, -170), tuple(REST_TIP)]
+            p = bezier(P, min(1.0, e)) if e <= 1 else REST_TIP + (REST_TIP - bezier(P, 2 - e)) * 0.35
+            a = np.radians(185.0 * (1 - e))              # screen angle of the point: 185 -> 90 (up) -> 0
+            return p, np.array([np.cos(a), -np.sin(a)])
+        if t > T_CUT[1] + 0.02:
             return None
         if t < T_WINDUP[0]:
             bob = 4 * np.sin(2 * np.pi * (t - T_SWORD_IN[0]) / 0.9)
@@ -764,8 +777,12 @@ class Slash:
     def draw_sword(self, t, fps, ink):
         """Adds the rapier's coverage to `ink` (full page). Motion blur: many sub-frames across
         the frame's shutter, each warped only into the box the blade occupies."""
-        fast = T_SWOOP[0] <= t <= T_CUT[1] + 0.02
-        n = 48 if fast else 1
+        if T_SWOOP[0] <= t <= T_CUT[1] + 0.02:
+            n = 48                                       # the blow: the blade is a streak
+        elif T_RETURN[0] <= t <= T_RETURN[1] - 0.15:
+            n = 24                                       # the swing back
+        else:
+            n = 1
         sh, sw_ = self.sword.shape
         if t < T_WINDUP[0]:
             p = span(t, *T_SWORD_IN)
