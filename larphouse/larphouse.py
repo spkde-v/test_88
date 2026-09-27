@@ -594,20 +594,19 @@ CUT_C = (945.0, 612.0)           # a point on the cut (page px)
 CUT_ANG = np.radians(5.0)        # the cut rises to the right
 CUT_U = np.array([np.cos(CUT_ANG), -np.sin(CUT_ANG)])      # along the cut, to the right
 CUT_N = np.array([-np.sin(CUT_ANG), -np.cos(CUT_ANG)])     # normal, pointing up
-SLIDE = -17.0 * CUT_U + 3.2 * CUT_N                         # where the upper half ends up
+SLIDE = 17.0 * CUT_U + 3.2 * CUT_N                          # where the upper half ends up (dragged with the blade)
 GAP = 2.2                        # px of clean gap at the cut
 
-T_SWORD_IN = (2.45, 2.95)        # the sword slides in from the right edge to above the word
-T_WINDUP = (2.95, 3.10)
-T_SWOOP = (3.10, 3.17)           # dives onto the cut line
+T_SWORD_IN = (2.72, 3.17)        # the sword flies in from the right edge, loops once and cuts, no stop
+T_SWOOP = T_SWORD_IN
 T_CUT = (3.17, 3.405)            # tip runs along the cut from X_ENTER to X_EXIT (hilt fully off screen)
-X_ENTER, X_EXIT = 1760.0, -760.0
+X_ENTER, X_EXIT = 110.0, 2700.0        # the blow runs left to right, the hilt clears the right edge
 # after the cut the rapier swings back in a wide arc over the top (its point sweeping from left,
 # through up, to right) and comes to rest level above the word, centred on the screen
 T_RETURN = (3.47, 4.4)
-T_VINES = (2.45, 5.7)        # the vine on the sword grows out along its stems from the moment it enters
+T_VINES = (2.72, 5.7)        # the vine on the sword grows out along its stems from the moment it enters
 T_VINE_PINK = (4.6, 6.35)    # its flowers and leaves flush pink
-REST_TIP = np.array([1340.0, 290.0])        # point of the resting sword (its middle is x = 960)
+REST_TIP = np.array([580.0, 290.0])         # point of the resting sword, pointing left (its middle is x = 960)
 T_SHAKE = 0.34                   # how long the frame shakes after the blade enters
 SWORD_LEN = 760
 ROSE_T0, ROSE_STEP, ROSE_OPEN = 4.15, 0.3, 0.7
@@ -762,7 +761,7 @@ class Slash:
                                   delay=float(rng.uniform(0.15, 0.5))))
         # roses: spread along the word, at bead sites
         xs_b = np.array([b['x'] for b in beads])
-        targets = np.array([1575.0, 1205.0, 830.0, 430.0])
+        targets = np.array([430.0, 830.0, 1205.0, 1575.0])     # they open left to right, after the blow
         roses = []
         used = set()
         for k, tx in enumerate(targets):
@@ -777,43 +776,40 @@ class Slash:
     # -- the rapier ----------------------------------------------------------------------------
     def tip_pose(self, t):
         """Point position and pointing direction (unit) of the rapier, or None when not shown."""
-        # it appears floating above the right half of the word, point to the left; winds up by
-        # drawing back to the right and raising its point; then drops onto the cut line
-        hover_tip = np.array([1150.0, 300.0])
-        hover_dir = np.array([-0.97, 0.24]); hover_dir /= np.linalg.norm(hover_dir)
-        wind_tip = np.array([1560.0, 225.0])
-        wind_dir = np.array([-0.92, -0.39]); wind_dir /= np.linalg.norm(wind_dir)
         if t < T_SWORD_IN[0]:
             return None
         if t >= T_RETURN[0]:
             u = span(t, *T_RETURN)
             e = ease_out_back(u, 0.9)                     # arrives with a slight overshoot and settle
-            P = [(X_EXIT, cut_y(X_EXIT)), (-420, 60), (560, -170), tuple(REST_TIP)]
+            P = [(X_EXIT, cut_y(X_EXIT)), (2380, 40), (1380, -170), tuple(REST_TIP)]
             p = bezier(P, min(1.0, e)) if e <= 1 else REST_TIP + (REST_TIP - bezier(P, 2 - e)) * 0.35
-            a = np.radians(185.0 * (1 - e))              # screen angle of the point: 185 -> 90 (up) -> 0
+            a = np.radians(5.0 + 175.0 * e)              # screen angle of the point: 5 -> 90 (up) -> 180
             return p, np.array([np.cos(a), -np.sin(a)])
         if t > T_CUT[1] + 0.02:
             return None
-        if t < T_WINDUP[0]:
-            # slides in from beyond the right edge, decelerating, and hangs there a moment
-            u = span(t, *T_SWORD_IN)
-            e = 1 - (1 - u) ** 3
-            start = hover_tip + np.array([1150.0, -60.0])
-            bob = 3 * np.sin(np.pi * u) * np.sin(2 * np.pi * (t - T_SWORD_IN[0]) / 0.6)
-            return start + (hover_tip - start) * e + np.array([0, bob]), hover_dir
-        if t < T_SWOOP[0]:
-            u = ease_io(span(t, *T_WINDUP))
-            dvec = hover_dir + (wind_dir - hover_dir) * u
-            return hover_tip + (wind_tip - hover_tip) * u, dvec / np.linalg.norm(dvec)
         if t < T_CUT[0]:
-            u = span(t, *T_SWOOP) ** 1.6
-            P = [wind_tip, (1700, 290), (1790, cut_y(1790) - 45), (X_ENTER, cut_y(X_ENTER))]
-            a0 = np.arctan2(-wind_dir[1], wind_dir[0]); a1 = np.arctan2(CUT_U[1], -CUT_U[0])
-            a = a0 + (a1 - a0) * smooth(u)
-            return bezier(P, u), np.array([np.cos(a), -np.sin(a)])
+            # flies in point first from beyond the right edge, high over the word, sweeps left over
+            # it, curls down round the capital and comes into the cut from the left at speed: one
+            # continuous movement, the point always leading
+            if not hasattr(self, 'entry'):
+                yE = cut_y(X_ENTER)
+                A_ = [(2120, 175), (1500, 160), (900, 165), (430, 190)]
+                B_ = [(430, 190), (-70, 225), (-60, yE), (X_ENTER, yE)]
+                pts = np.array([bezier(A_, u) for u in np.linspace(0, 1, 120)] +
+                               [bezier(B_, u) for u in np.linspace(0, 1, 120)[1:]])
+                seg = np.linalg.norm(np.diff(pts, axis=0), axis=1)
+                self.entry = (pts, np.concatenate([[0], np.cumsum(seg)]))
+            pts, L = self.entry
+            u = span(t, *T_SWORD_IN) ** 1.25              # gathering speed all the way
+            d = u * L[-1]
+            x = np.interp(d, L, pts[:, 0]); y = np.interp(d, L, pts[:, 1])
+            x2 = np.interp(min(L[-1], d + 3), L, pts[:, 0]); y2 = np.interp(min(L[-1], d + 3), L, pts[:, 1])
+            x1 = np.interp(max(0, d - 3), L, pts[:, 0]); y1 = np.interp(max(0, d - 3), L, pts[:, 1])
+            q = np.array([x2 - x1, y2 - y1])
+            return np.array([x, y]), q / (np.linalg.norm(q) + 1e-9)
         u = span(t, *T_CUT)
         x = X_ENTER + (X_EXIT - X_ENTER) * u
-        return np.array([x, cut_y(x)]), -CUT_U
+        return np.array([x, cut_y(x)]), CUT_U
 
     def split_vines(self, full):
         """Separate the vine from the bare sword: everything outside the blade/guard/grip
@@ -875,15 +871,15 @@ class Slash:
     def draw_sword(self, t, fps, ink, clear=None, pink_out=None):
         """Adds the rapier's coverage to `ink` (full page). Motion blur: many sub-frames across
         the frame's shutter, each warped only into the box the blade occupies."""
-        if T_SWOOP[0] <= t <= T_CUT[1] + 0.02:
+        if T_CUT[0] - 0.12 <= t <= T_CUT[1] + 0.02:
             n = 48                                       # the blow: the blade is a streak
         elif T_RETURN[0] <= t <= T_RETURN[1] - 0.15:
             n = 24                                       # the swing back
         else:
             n = 1
         sh, sw_ = self.sword.shape
-        if T_SWORD_IN[0] <= t < T_SWORD_IN[1] - 0.15:
-            n = max(n, 12)                               # it slides in fast: a little motion blur
+        if T_SWORD_IN[0] <= t < T_CUT[0] - 0.12:
+            n = max(n, 16)                               # flying in: motion blur
         spr = self.sword
         sil = self.sword_sil
         vink, vpink = self.vine_sprites(t)               # the vine rides along, blur and all
@@ -1144,7 +1140,7 @@ class Slash:
             u = t - tp
             if u < 0 or u > 0.9:
                 continue
-            vx = -rng.uniform(250, 700)
+            vx = rng.uniform(250, 700)
             vy = rng.uniform(-260, 60)
             px = x0 + vx * u
             py = cut_y(x0) + vy * u + 900 * u * u
