@@ -597,7 +597,7 @@ CUT_N = np.array([-np.sin(CUT_ANG), -np.cos(CUT_ANG)])     # normal, pointing up
 SLIDE = -17.0 * CUT_U + 3.2 * CUT_N                         # where the upper half ends up
 GAP = 2.2                        # px of clean gap at the cut
 
-T_SWORD_IN = (2.45, 2.95)        # the rapier bleeds in above the end of the word
+T_SWORD_IN = (2.45, 2.95)        # the sword slides in from the right edge to above the word
 T_WINDUP = (2.95, 3.10)
 T_SWOOP = (3.10, 3.17)           # dives onto the cut line
 T_CUT = (3.17, 3.405)            # tip runs along the cut from X_ENTER to X_EXIT (hilt fully off screen)
@@ -605,8 +605,8 @@ X_ENTER, X_EXIT = 1760.0, -760.0
 # after the cut the rapier swings back in a wide arc over the top (its point sweeping from left,
 # through up, to right) and comes to rest level above the word, centred on the screen
 T_RETURN = (3.47, 4.4)
-T_VINES = (4.3, 6.0)         # the vine on the resting sword grows out along its stems
-T_VINE_PINK = (5.0, 6.35)    # its flowers and leaves flush pink
+T_VINES = (2.45, 5.7)        # the vine on the sword grows out along its stems from the moment it enters
+T_VINE_PINK = (4.6, 6.35)    # its flowers and leaves flush pink
 REST_TIP = np.array([1340.0, 290.0])        # point of the resting sword (its middle is x = 960)
 T_SHAKE = 0.34                   # how long the frame shakes after the blade enters
 SWORD_LEN = 760
@@ -795,8 +795,12 @@ class Slash:
         if t > T_CUT[1] + 0.02:
             return None
         if t < T_WINDUP[0]:
-            bob = 4 * np.sin(2 * np.pi * (t - T_SWORD_IN[0]) / 0.9)
-            return hover_tip + np.array([0, bob]), hover_dir
+            # slides in from beyond the right edge, decelerating, and hangs there a moment
+            u = span(t, *T_SWORD_IN)
+            e = 1 - (1 - u) ** 3
+            start = hover_tip + np.array([1150.0, -60.0])
+            bob = 3 * np.sin(np.pi * u) * np.sin(2 * np.pi * (t - T_SWORD_IN[0]) / 0.6)
+            return start + (hover_tip - start) * e + np.array([0, bob]), hover_dir
         if t < T_SWOOP[0]:
             u = ease_io(span(t, *T_WINDUP))
             dvec = hover_dir + (wind_dir - hover_dir) * u
@@ -855,7 +859,7 @@ class Slash:
         # sway: stems writhe gently, more the further they reach from the blade and while growing
         h, w = self.vine.shape
         reach = np.abs(self.vyy - h / 2) / (h / 2)
-        amp = (1.2 + 2.6 * (1 - smooth((t - T_VINES[1]) / 0.8))) * reach
+        amp = (1.2 + 2.2 * (1 - smooth((t - T_VINES[1]) / 0.8))) * reach
         ph = 2 * np.pi * (self.vxx / 170.0 - t / 1.9)
         dy = amp * np.sin(ph) * np.sign(self.vyy - h / 2)
         dx = 0.6 * amp * np.cos(ph * 0.8 + 1.3)
@@ -878,16 +882,11 @@ class Slash:
         else:
             n = 1
         sh, sw_ = self.sword.shape
-        if t < T_WINDUP[0]:
-            p = span(t, *T_SWORD_IN)
-            q = np.clip((p * 1.4 - self.sword_field) / 0.4, 0, 1)
-            fade = np.clip(p * 2.5, 0, 1)
-            spr = (self.sword_stain * (1 - q) + self.sword * q) * fade
-            sil = self.sword_sil * smooth(p * 1.4 - 0.3)
-        else:
-            spr = self.sword
-            sil = self.sword_sil
-        vink, vpink = self.vine_sprites(t) if n == 1 else (None, None)
+        if T_SWORD_IN[0] <= t < T_SWORD_IN[1] - 0.15:
+            n = max(n, 12)                               # it slides in fast: a little motion blur
+        spr = self.sword
+        sil = self.sword_sil
+        vink, vpink = self.vine_sprites(t)               # the vine rides along, blur and all
         if vink is not None:
             spr = np.maximum(spr, vink)
         acc_p = np.zeros((H, W), np.float32) if vpink is not None else None
