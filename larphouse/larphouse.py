@@ -594,19 +594,23 @@ CUT_C = (945.0, 612.0)           # a point on the cut (page px)
 CUT_ANG = np.radians(5.0)        # the cut rises to the right
 CUT_U = np.array([np.cos(CUT_ANG), -np.sin(CUT_ANG)])      # along the cut, to the right
 CUT_N = np.array([-np.sin(CUT_ANG), -np.cos(CUT_ANG)])     # normal, pointing up
-SLIDE = 17.0 * CUT_U + 3.2 * CUT_N                          # where the upper half ends up (dragged with the blade)
+SLIDE = -17.0 * CUT_U + 3.2 * CUT_N                         # where the upper half ends up (dragged with the blade)
 GAP = 2.2                        # px of clean gap at the cut
 
-T_SWORD_IN = (2.72, 3.17)        # the sword flies in from the right edge, loops once and cuts, no stop
+# The blow: the sword flies in point first from beyond the right edge along the cut line and runs
+# straight through the word, right to left; it slows down through the capital L and stops just past
+# it. Then it turns, its point swinging down, and plants itself upright in the middle of the word,
+# the blade in the gap between "p" and "h" (larp.house).
+T_CUT = (3.0, 3.46)
+X_ENTER, X_END = 2060.0, 105.0   # tip x when entering (just off screen) and where it comes to rest
+CUT_EASE = 2.4                   # ease-out power: very fast at first, braking through the L
+T_SWORD_IN = (T_CUT[0], T_CUT[0])
 T_SWOOP = T_SWORD_IN
-T_CUT = (3.17, 3.405)            # tip runs along the cut from X_ENTER to X_EXIT (hilt fully off screen)
-X_ENTER, X_EXIT = 110.0, 2700.0        # the blow runs left to right, the hilt clears the right edge
-# after the cut the rapier swings back in a wide arc over the top (its point sweeping from left,
-# through up, to right) and comes to rest level above the word, centred on the screen
-T_RETURN = (3.47, 4.4)
-T_VINES = (2.72, 5.7)        # the vine on the sword grows out along its stems from the moment it enters
+T_RETURN = (3.46, 4.4)
+T_VINES = (3.0, 5.7)         # the vine on the sword grows out along its stems from the moment it enters
 T_VINE_PINK = (4.6, 6.35)    # its flowers and leaves flush pink
-REST_TIP = np.array([580.0, 290.0])         # point of the resting sword, pointing left (its middle is x = 960)
+PLANT_X = 1001.5             # the gap between "p" and "h"
+REST_TIP = np.array([PLANT_X, 905.0])       # the planted sword: point down, blade through the word
 T_SHAKE = 0.34                   # how long the frame shakes after the blade enters
 SWORD_LEN = 760
 ROSE_T0, ROSE_STEP, ROSE_OPEN = 4.15, 0.3, 0.7
@@ -616,9 +620,17 @@ def cut_y(x):
     return CUT_C[1] - (x - CUT_C[0]) * np.tan(CUT_ANG)
 
 
+def cut_progress(t):
+    """0..1 along the cut: fast at first, braking to a stop at X_END."""
+    u = span(t, *T_CUT)
+    return 1 - (1 - u) ** CUT_EASE
+
+
 def t_pass(x):
-    """When the tip passes page x on the cut."""
-    return T_CUT[0] + (X_ENTER - x) / (X_ENTER - X_EXIT) * (T_CUT[1] - T_CUT[0])
+    """When the tip passes page x on the cut (inverse of cut_progress)."""
+    f = np.clip((X_ENTER - np.asarray(x, np.float64)) / (X_ENTER - X_END), 0, 0.9999)
+    u = 1 - (1 - f) ** (1 / CUT_EASE)
+    return T_CUT[0] + u * (T_CUT[1] - T_CUT[0])
 
 
 def ease_out_back(x, k=1.4):
@@ -761,7 +773,7 @@ class Slash:
                                   delay=float(rng.uniform(0.15, 0.5))))
         # roses: spread along the word, at bead sites
         xs_b = np.array([b['x'] for b in beads])
-        targets = np.array([430.0, 830.0, 1205.0, 1575.0])     # they open left to right, after the blow
+        targets = np.array([1575.0, 1205.0, 830.0, 430.0])     # they open right to left, after the blow
         roses = []
         used = set()
         for k, tx in enumerate(targets):
@@ -776,40 +788,21 @@ class Slash:
     # -- the rapier ----------------------------------------------------------------------------
     def tip_pose(self, t):
         """Point position and pointing direction (unit) of the rapier, or None when not shown."""
-        if t < T_SWORD_IN[0]:
+        if t < T_CUT[0]:
             return None
         if t >= T_RETURN[0]:
+            # from rest just past the L: rises and swings right, the point turning from left to
+            # down, and comes down into the gap between p and h with a small settling bounce
             u = span(t, *T_RETURN)
-            e = ease_out_back(u, 0.9)                     # arrives with a slight overshoot and settle
-            P = [(X_EXIT, cut_y(X_EXIT)), (2380, 40), (1380, -170), tuple(REST_TIP)]
+            e = ease_out_back(u, 0.8)
+            y0 = cut_y(X_END)
+            P = [(X_END, y0), (X_END - 60, y0 - 330), (PLANT_X - 40, REST_TIP[1] - 520), tuple(REST_TIP)]
             p = bezier(P, min(1.0, e)) if e <= 1 else REST_TIP + (REST_TIP - bezier(P, 2 - e)) * 0.35
-            a = np.radians(5.0 + 175.0 * e)              # screen angle of the point: 5 -> 90 (up) -> 180
+            a0 = np.arctan2(CUT_U[1], -CUT_U[0])           # pointing left along the cut
+            a = a0 + (np.radians(-90.0) - a0) * e          # left -> down, through down-left (-175 -> -90 deg)
             return p, np.array([np.cos(a), -np.sin(a)])
-        if t > T_CUT[1] + 0.02:
-            return None
-        if t < T_CUT[0]:
-            # flies in point first from beyond the right edge, high over the word, sweeps left over
-            # it, curls down round the capital and comes into the cut from the left at speed: one
-            # continuous movement, the point always leading
-            if not hasattr(self, 'entry'):
-                yE = cut_y(X_ENTER)
-                A_ = [(2120, 175), (1500, 160), (900, 165), (430, 190)]
-                B_ = [(430, 190), (-70, 225), (-60, yE), (X_ENTER, yE)]
-                pts = np.array([bezier(A_, u) for u in np.linspace(0, 1, 120)] +
-                               [bezier(B_, u) for u in np.linspace(0, 1, 120)[1:]])
-                seg = np.linalg.norm(np.diff(pts, axis=0), axis=1)
-                self.entry = (pts, np.concatenate([[0], np.cumsum(seg)]))
-            pts, L = self.entry
-            u = span(t, *T_SWORD_IN) ** 1.25              # gathering speed all the way
-            d = u * L[-1]
-            x = np.interp(d, L, pts[:, 0]); y = np.interp(d, L, pts[:, 1])
-            x2 = np.interp(min(L[-1], d + 3), L, pts[:, 0]); y2 = np.interp(min(L[-1], d + 3), L, pts[:, 1])
-            x1 = np.interp(max(0, d - 3), L, pts[:, 0]); y1 = np.interp(max(0, d - 3), L, pts[:, 1])
-            q = np.array([x2 - x1, y2 - y1])
-            return np.array([x, y]), q / (np.linalg.norm(q) + 1e-9)
-        u = span(t, *T_CUT)
-        x = X_ENTER + (X_EXIT - X_ENTER) * u
-        return np.array([x, cut_y(x)]), CUT_U
+        x = X_ENTER + (X_END - X_ENTER) * cut_progress(t)
+        return np.array([x, cut_y(x)]), -CUT_U
 
     def split_vines(self, full):
         """Separate the vine from the bare sword: everything outside the blade/guard/grip
@@ -1140,7 +1133,7 @@ class Slash:
             u = t - tp
             if u < 0 or u > 0.9:
                 continue
-            vx = rng.uniform(250, 700)
+            vx = -rng.uniform(250, 700)
             vy = rng.uniform(-260, 60)
             px = x0 + vx * u
             py = cut_y(x0) + vy * u + 900 * u * u
