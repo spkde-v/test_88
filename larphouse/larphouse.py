@@ -39,9 +39,15 @@ CORNER_STEPS = 40            # growth stages per corner in a sprite sheet
 CORNER_COLS = 8
 
 # ---------------------------------------------------------------- timeline (seconds)
-T_LETTERS = (0.5, 2.9)       # glyphs bleed in, left to right
-T_L_EXTRA = 0.35             # the capital runs longer than the others
-STAGGER = 0.13
+T_LETTERS = (0.45, 2.9)      # the whole word, from the first drop to the last letter full
+# The capital first: a drop falls into the middle of its stem at T_L_DROP, the ink runs along the
+# stem and out into the scrolls over T_L_FLOW, the lily on top fills last and catches a glint.
+T_L_DROP = 0.45
+T_L_FLOW = (0.58, 1.7)
+DROP_FALL = 0.13             # seconds a drop takes to fall onto its letter
+# Then each lowercase letter gets its own drop: (drop time, flow duration). Each has its own tempo.
+T_GLYPHS = [(1.12, 0.78), (1.27, 0.62), (1.4, 0.9), (1.58, 0.7), (1.71, 0.85), (1.88, 0.6),
+            (2.02, 0.8), (2.2, 0.68)]
 # corner vines: (start, duration, ease-out power) per corner — deliberately unequal so they
 # don't grow in lockstep. Order: bottom right, bottom left, top right, top left.
 T_CORNERS = [(0.25, 4.0, 1.3), (0.6, 3.5, 1.7), (0.0, 3.7, 1.5), (0.45, 4.3, 1.9)]
@@ -144,6 +150,49 @@ class Layer:
         return (self.stain * (1 - sharp) + self.ink * sharp) * dens
 
 
+class FlowLayer(Layer):
+    """Ink poured into a letter: it spreads from where the drop lands along the strokes (geodesic
+    distance through the letter), filling the middle of each stroke before its edges and the
+    thick strokes before the thin ones. A wet, slightly spread rim runs just ahead of the front."""
+
+    def __init__(self, ink, x, y, field, soft=0.07, wet=0.10):
+        super().__init__(ink, x, y, field, soft=soft, stain=0.6, blur=2.2)
+        self.wet = wet
+
+    def coverage(self, p):
+        if p <= 0:
+            return None
+        f = p * (1 + self.soft + self.wet)
+        q = np.clip((f - self.field) / self.soft, 0, 1)
+        q = q * q * (3 - 2 * q)
+        body = self.ink * q
+        # the wet front: a band just behind and ahead of it, a touch spread beyond the stroke edge;
+        # once the whole letter is full it dries back into the clean print
+        d = f - self.field                               # > 0: already reached
+        band = np.where(d > 0, np.exp(-(d / self.wet) ** 2), np.exp(-(d / (self.wet * 0.25)) ** 2))
+        band = band * (1 - smooth((p - 0.9) / 0.1))
+        return np.maximum(body, self.stain * band * 1.25)
+
+
+def flow_field(mask, seeds, late=None, step=2):
+    """0 where the drop lands ... 1 last: mostly distance travelled along the letter, a little of
+    'edges after middles' (so the ink runs down the stroke channels) and an optional extra delay."""
+    geo = geodesic(mask > 0.3, seeds, step=step)
+    dt = cv2.distanceTransform((mask > 0.3).astype(np.uint8), cv2.DIST_L2, 5)
+    dt = cv2.GaussianBlur(dt, (0, 0), 1.5)
+    edge = 1 - dt / (dt.max() + 1e-6)
+    f = 0.8 * geo + 0.2 * edge
+    if late is not None:
+        f = f + late
+    # even the pace out: rank the letter's own pixels so the front covers equal ink per unit time
+    m = mask > 0.05
+    r = np.zeros_like(f)
+    v = f[m]
+    r[m] = v.argsort().argsort().astype(np.float32) / max(1, v.size - 1)
+    r[~m] = 1.0
+    return r.astype(np.float32)
+
+
 def engrave(mask, seed):
     """Give flat font glyphs the engraved, lit-metal look of the reference capital:
     solid ink body, a stippled bevel on the lit (upper-left) side of each stroke."""
@@ -224,18 +273,33 @@ def make_layers():
     layers = {}
     L, lx, ly = A['L']
     h, w = L.shape
-    # the capital unfurls from the middle of its stem out to the scroll tips
-    geo = geodesic(L > 0.3, [(h * 0.55, w * 0.33)], step=2)
-    fL = 0.62 * geo + 0.38 * rank_noise(L.shape, 14, 1)
-    layers['L'] = Layer(L, lx, ly, fL, soft=0.45, blur=9)
+    # the capital: the drop lands in the middle of the stem; the ink runs up and down the stem and
+    # out along every scroll to its tip; the lily on top is held back so it fills last
+    drop = (h * 0.52, w * 0.36)
+    yy = np.linspace(0, 1, h, dtype=np.float32)[:, None] * np.ones((1, w), np.float32)
+    lily = (1 - smooth(yy / 0.17)) * 0.55
+    fL = flow_field(L, [drop], late=lily)
+    layers['L'] = FlowLayer(L, lx, ly, fL, soft=0.06, wet=0.09)
+    layers['L_drop'] = (lx + drop[1], ly + drop[0])
+    ys_, xs_ = np.nonzero(L > 0.5)
+    top = ys_.min()
+    layers['L_lily'] = (lx + float(xs_[ys_ < top + 6].mean()), ly + top + 34.0)   # the lily's heart
 
+    rng = np.random.default_rng(55)
     layers['glyphs'] = []
+    layers['glyph_drops'] = []
     for i, (g, gx, gy) in enumerate(A['glyphs']):
         gh, gw = g.shape
-        yy = np.linspace(0, 1, gh, dtype=np.float32)[:, None] * np.ones((1, gw), np.float32)
-        f = 0.55 * rank_noise(g.shape, 16, 10 + i) + 0.3 * yy + 0.15 * rank_noise(g.shape, 2.5, 30 + i)
+        # each letter's drop lands on one of its thickest points, a different one each time
+        dt = cv2.distanceTransform((g > 0.3).astype(np.uint8), cv2.DIST_L2, 5)
+        cand = np.argwhere(dt > dt.max() * 0.7)
+        pick = cand[int(rng.integers(len(cand)))]
+        f = flow_field(g, [(float(pick[0]), float(pick[1]))])
+        f = 0.9 * f + 0.1 * rank_noise(g.shape, 3, 30 + i)
         f = (f - f.min()) / (f.max() - f.min())
-        layers['glyphs'].append(Layer(g, gx, gy, f, soft=0.5, blur=8))
+        layers['glyphs'].append(FlowLayer(g, gx, gy, f, soft=float(rng.uniform(0.05, 0.1)),
+                                          wet=float(rng.uniform(0.07, 0.13))))
+        layers['glyph_drops'].append((gx + pick[1], gy + pick[0]))
 
     # corner vines, mirrored into all four corners; they grow from the corner along the stems
     cv = crop(ink_from(os.path.join(REF, 'corner-vine.png'), lo=0.2, hi=0.75))
@@ -982,16 +1046,64 @@ class Film:
         self.slash = Slash(self)
         self.slash.sites(self.title(DURATION))
 
+    def drops(self, t, ink):
+        """Falling drops, their splash (a few flecks that dry away) — uint8 canvas."""
+        lay = self.lay
+        items = [(T_L_DROP, lay['L_drop'], 6.5, 0)] + \
+                [(td, p, 4.5, 1 + i) for i, ((td, _), p) in enumerate(zip(T_GLYPHS, lay['glyph_drops']))]
+        S = 16
+        for td, (px, py), r, k in items:
+            u = (t - td) / DROP_FALL
+            if 0 <= u < 1:
+                y = py - 150 * (1 - u * u)                       # falls, accelerating
+                st = 1 + 1.3 * u                                  # stretches as it speeds up
+                cv2.ellipse(ink, (int(px * S), int(y * S)), (int(r * 0.8 * S), int(r * st * S)), 0, 0, 360,
+                            255, -1, cv2.LINE_AA, 4)
+            w = t - (td + DROP_FALL)
+            if 0 <= w < 1.1:
+                rng = np.random.default_rng(600 + k)
+                n = int(rng.integers(3, 7))
+                fade = 1 - smooth((w - 0.35) / 0.75)
+                grow = smooth(w / 0.08)
+                for j in range(n):
+                    a = rng.uniform(0, 2 * np.pi)
+                    d = rng.uniform(1.2, 3.2) * r * 2.2
+                    rr = rng.uniform(0.9, 2.3) * grow
+                    cx, cy = px + np.cos(a) * d * (0.6 + 0.4 * grow), py + np.sin(a) * d * 0.7 * (0.6 + 0.4 * grow)
+                    cv2.circle(ink, (int(cx * S), int(cy * S)), max(1, int(rr * S)), int(255 * fade), -1, cv2.LINE_AA, 4)
+                # the splat itself spreads for an instant before the letter drinks it in
+                sp = np.sin(np.pi * np.clip(w / 0.22, 0, 1))
+                if sp > 0:
+                    cv2.ellipse(ink, (int(px * S), int(py * S)), (int(r * 1.8 * sp * S), int(r * 1.1 * sp * S)), 0, 0, 360,
+                                int(255 * sp), -1, cv2.LINE_AA, 4)
+
+    def glint(self, t):
+        """A small four-point star catching the lily of the L as it fills (a clearing, so it reads
+        bright on a light page and dark on a dark one). Returns (x0, y0, patch) or None."""
+        tg = T_L_FLOW[1] - 0.12
+        u = (t - tg) / 0.4
+        if u <= 0 or u >= 1:
+            return None
+        k = np.sin(np.pi * u) ** 1.5
+        x, y = self.lay['L_lily']
+        R = 34
+        yy, xx = np.mgrid[-R:R + 1, -R:R + 1].astype(np.float32)
+        ang = 0.6 * u
+        c, s_ = np.cos(ang), np.sin(ang)
+        a_, b_ = xx * c + yy * s_, -xx * s_ + yy * c
+        star = np.exp(-np.abs(a_) / 1.3) * np.exp(-np.abs(b_) / (R * 0.45)) + \
+               np.exp(-np.abs(b_) / 1.3) * np.exp(-np.abs(a_) / (R * 0.45))
+        star = np.clip(star * 1.2 + np.exp(-(xx ** 2 + yy ** 2) / 18), 0, 1) * k
+        return int(x) - R, int(y) - R, star
+
     def title(self, t):
         """Coverage of the printed word (the capital and the lowercase) at time t."""
         out = np.zeros((H, W), np.float32)
         lay = self.lay
-        a, b = T_LETTERS
-        glyph_len = (b - a) - STAGGER * len(lay['glyphs'])
-        parts = [(lay['L'], span(t, a, a + glyph_len + T_L_EXTRA))]
-        for i, g in enumerate(lay['glyphs']):
-            s = a + STAGGER * (i + 1) + 0.05
-            parts.append((g, span(t, s, s + glyph_len)))
+        parts = [(lay['L'], ease_io(span(t, *T_L_FLOW)) ** 0.9)]
+        for g, (td, du) in zip(lay['glyphs'], T_GLYPHS):
+            t0 = td + DROP_FALL
+            parts.append((g, 1 - (1 - span(t, t0, t0 + du)) ** 1.6))   # fast pour, slow finish
         for layer, p in parts:
             c = layer.coverage(p)
             if c is None:
@@ -1030,6 +1142,7 @@ class Film:
             title = split
         np.maximum(ink, title, out=ink)
         chips = np.zeros((H, W), np.uint8)
+        self.drops(t, chips)
         sl.chips(t, chips)
         np.maximum(ink, chips.astype(np.float32) / 255, out=ink)
         deco8 = np.zeros((H, W), np.uint8)
@@ -1064,6 +1177,12 @@ class Film:
         P *= (1 - h_[..., None]); A *= (1 - h_)
         lay_over(rose_red * dens * 0.95, RED)
         lay_over(deco * dens, PRINT)
+        gl = self.glint(t)
+        if gl is not None:
+            gx0, gy0, star = gl
+            hh, ww = star.shape
+            P[gy0:gy0 + hh, gx0:gx0 + ww] *= (1 - star[..., None])
+            A[gy0:gy0 + hh, gx0:gx0 + ww] *= (1 - star)
         tr = sl.trail(t)
         if tr is not None:
             smear, core = tr
