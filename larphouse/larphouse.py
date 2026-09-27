@@ -27,6 +27,7 @@ INK = np.array([33, 27, 30], np.float32) / 255      # warm overprint dark, never
 RED = np.array([150, 28, 38], np.float32) / 255
 CAT_EYE = np.array([240, 234, 222], np.float32) / 255
 BLOOD = np.array([118, 12, 22], np.float32) / 255
+PINK = np.array([222, 128, 150], np.float32) / 255    # the flowers and leaves of the vine on the sword
 SHOW_CAT = False             # the cat sits this version out
 # --light: the print (letters, corner vines, the sword) in pale paper colour, for dark backgrounds.
 # The red plate (the roses) and the cat keep their colours.
@@ -604,6 +605,8 @@ X_ENTER, X_EXIT = 1760.0, -760.0
 # after the cut the rapier swings back in a wide arc over the top (its point sweeping from left,
 # through up, to right) and comes to rest level above the word, centred on the screen
 T_RETURN = (3.47, 4.4)
+T_VINES = (4.3, 6.0)         # the vine on the resting sword grows out along its stems
+T_VINE_PINK = (5.0, 6.35)    # its flowers and leaves flush pink
 REST_TIP = np.array([1340.0, 290.0])        # point of the resting sword (its middle is x = 960)
 T_SHAKE = 0.34                   # how long the frame shakes after the blade enters
 SWORD_LEN = 760
@@ -724,7 +727,8 @@ class Slash:
         jag2 = np.interp(s, np.arange(-1200, 1200, 37), rng.normal(0, 1.4, len(range(-1200, 1200, 37))))
         self.d = d + jag1 + jag2
         self.s = s
-        self.sword, self.sword_sil = sword_sprite()
+        full, self.sword_sil = sword_sprite()
+        self.split_vines(full)
         self.sword_field = rank_noise(self.sword.shape, 5, 90)
         self.sword_stain = cv2.GaussianBlur(self.sword, (0, 0), 6) * 0.5
         self.rose_ink, self.rose_red, self.rose_sil = rose_sprite()
@@ -807,7 +811,64 @@ class Slash:
         x = X_ENTER + (X_EXIT - X_ENTER) * u
         return np.array([x, cut_y(x)]), -CUT_U
 
-    def draw_sword(self, t, fps, ink, clear=None):
+    def split_vines(self, full):
+        """Separate the vine from the bare sword: everything outside the blade/guard/grip
+        silhouette is vine. The vine grows from where it touches the sword out to its tips
+        (distance along the stems); its closed shapes (petals, leaves) get a pink fill."""
+        body = self.sword_sil > 0.5
+        near = cv2.dilate(body.astype(np.uint8), np.ones((3, 3), np.uint8)) > 0
+        vine = full * (~near)
+        self.sword = full * near                                     # blade, guard, grip
+        self.vine = vine.astype(np.float32)
+        m = vine > 0.3
+        # roots: vine ink right next to the sword
+        ring = cv2.dilate(near.astype(np.uint8), np.ones((9, 9), np.uint8)) > 0
+        ys, xs = np.nonzero(m & ring)
+        pick = np.linspace(0, len(ys) - 1, min(60, len(ys))).astype(int)
+        geo = geodesic(cv2.dilate(m.astype(np.uint8), np.ones((3, 3), np.uint8)) > 0,
+                       [(float(ys[i]), float(xs[i])) for i in pick], step=1)
+        self.vine_field = np.clip(0.9 * geo + 0.1 * rank_noise(m.shape, 3, 91), 0, 1).astype(np.float32)
+        # petals and leaves: small areas enclosed by vine strokes
+        closed = cv2.morphologyEx((vine > 0.25).astype(np.uint8), cv2.MORPH_CLOSE,
+                                  cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)))
+        flood = closed.copy()
+        cv2.floodFill(flood, np.zeros((flood.shape[0] + 2, flood.shape[1] + 2), np.uint8), (0, 0), 1)
+        holes = ((flood == 0) & (closed == 0)).astype(np.uint8)
+        n, lab, st, _ = cv2.connectedComponentsWithStats(holes, 4)
+        petal = np.zeros(m.shape, np.float32)
+        for k in range(1, n):
+            if 6 < st[k, 4] < 900:
+                petal[lab == k] = 1
+        petal = cv2.dilate(petal, np.ones((3, 3), np.uint8))
+        self.vine_pink = (cv2.GaussianBlur(petal, (0, 0), 0.8) * ~near).astype(np.float32)
+        h, w = m.shape
+        self.vyy, self.vxx = np.mgrid[0:h, 0:w].astype(np.float32)
+
+    def vine_sprites(self, t):
+        """The vine at time t in sprite space: ink and pink coverage, grown and swaying."""
+        g = span(t, *T_VINES)
+        if g <= 0:
+            return None, None
+        s_ = 0.14
+        q = np.clip((g * (1 + s_) - self.vine_field) / s_, 0, 1)
+        q = q * q * (3 - 2 * q)
+        # sway: stems writhe gently, more the further they reach from the blade and while growing
+        h, w = self.vine.shape
+        reach = np.abs(self.vyy - h / 2) / (h / 2)
+        amp = (1.2 + 2.6 * (1 - smooth((t - T_VINES[1]) / 0.8))) * reach
+        ph = 2 * np.pi * (self.vxx / 170.0 - t / 1.9)
+        dy = amp * np.sin(ph) * np.sign(self.vyy - h / 2)
+        dx = 0.6 * amp * np.cos(ph * 0.8 + 1.3)
+        mx, my = (self.vxx - dx).astype(np.float32), (self.vyy - dy).astype(np.float32)
+        ink = cv2.remap((self.vine * q).astype(np.float32), mx, my, cv2.INTER_LINEAR)
+        pk = span(t, *T_VINE_PINK)
+        pink = None
+        if pk > 0:
+            pq = np.clip((smooth(pk) * 1.3 - self.vine_field) / 0.3, 0, 1) * q
+            pink = cv2.remap((self.vine_pink * pq).astype(np.float32), mx, my, cv2.INTER_LINEAR)
+        return ink, pink
+
+    def draw_sword(self, t, fps, ink, clear=None, pink_out=None):
         """Adds the rapier's coverage to `ink` (full page). Motion blur: many sub-frames across
         the frame's shutter, each warped only into the box the blade occupies."""
         if T_SWOOP[0] <= t <= T_CUT[1] + 0.02:
@@ -826,6 +887,10 @@ class Slash:
         else:
             spr = self.sword
             sil = self.sword_sil
+        vink, vpink = self.vine_sprites(t) if n == 1 else (None, None)
+        if vink is not None:
+            spr = np.maximum(spr, vink)
+        acc_p = np.zeros((H, W), np.float32) if vpink is not None else None
         acc = np.zeros((H, W), np.float32)
         acc_s = np.zeros((H, W), np.float32)
         corners = np.array([[0, 0, 1], [sw_, 0, 1], [0, sh, 1], [sw_, sh, 1]], np.float64)
@@ -849,6 +914,10 @@ class Slash:
             M[0, 2] -= x0; M[1, 2] -= y0
             acc[y0:y1, x0:x1] += cv2.warpAffine(spr, M, (x1 - x0, y1 - y0), flags=cv2.INTER_LINEAR)
             acc_s[y0:y1, x0:x1] += cv2.warpAffine(sil, M, (x1 - x0, y1 - y0), flags=cv2.INTER_LINEAR)
+            if acc_p is not None:
+                acc_p[y0:y1, x0:x1] += cv2.warpAffine(vpink, M, (x1 - x0, y1 - y0), flags=cv2.INTER_LINEAR)
+        if acc_p is not None and pink_out is not None:
+            np.maximum(pink_out, np.clip(acc_p / n, 0, 1), out=pink_out)
         if drawn:
             np.maximum(ink, np.clip(acc / n, 0, 1), out=ink)
             if clear is not None:
@@ -1175,7 +1244,8 @@ class Film:
         sl.draw_roses(t, deco, rose_red, halo)
         sword = np.zeros((H, W), np.float32)
         sword_clear = np.zeros((H, W), np.float32)
-        sl.draw_sword(t, self.fps, sword, sword_clear)
+        sword_pink = np.zeros((H, W), np.float32)
+        sl.draw_sword(t, self.fps, sword, sword_clear, sword_pink)
 
         # breathing grain: three fixed textures cross-faded slowly (no per-frame noise crawl)
         ph = t * 0.6
@@ -1212,6 +1282,7 @@ class Film:
             P *= (1 - core[..., None]); A *= (1 - core)
         # the sword's body hides what it passes over (paper under its lines)
         P *= (1 - sword_clear[..., None]); A *= (1 - sword_clear)
+        lay_over(sword_pink * 0.9, PINK)
         lay_over(sword, PRINT)
         rgb = P / np.maximum(A, 1e-6)[..., None]
         if self.cat is not None:
