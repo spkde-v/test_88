@@ -604,9 +604,9 @@ X_ENTER, X_EXIT = 1760.0, -760.0
 # after the cut the rapier swings back in a wide arc over the top (its point sweeping from left,
 # through up, to right) and comes to rest level above the word, centred on the screen
 T_RETURN = (3.47, 4.4)
-REST_TIP = np.array([1300.0, 318.0])        # point of the resting rapier (its middle is x = 960)
+REST_TIP = np.array([1340.0, 290.0])        # point of the resting sword (its middle is x = 960)
 T_SHAKE = 0.34                   # how long the frame shakes after the blade enters
-SWORD_LEN = 680
+SWORD_LEN = 760
 ROSE_T0, ROSE_STEP, ROSE_OPEN = 4.15, 0.3, 0.7
 
 
@@ -655,6 +655,37 @@ def rapier_sprite():
     return r
 
 
+def sword_sprite():
+    """The sword wrapped in flowering vines (sword-flowers.webp, a pencil drawing on paper).
+    The paper and the loose background scribbles are removed: darkness is measured against the
+    local paper tone and kept only inside a hull around the sword and its vines. Returns the ink
+    and an opaque silhouette of blade, guard and grip (it hides what the sword passes over),
+    laid horizontal with the point to +x and the blade's axis on the middle row."""
+    g = np.asarray(Image.open(os.path.join(REF, 'sword-flowers.webp')).convert('L')).astype(np.float32)
+    bg = cv2.GaussianBlur(g, (0, 0), 25)
+    d = np.clip(bg - g, 0, None)
+    ink = np.clip((d - 30) / 42, 0, 1) ** 0.7              # pencil strokes pressed to full ink
+    hull = [(520, 55), (765, 65), (795, 250), (705, 420), (705, 565), (900, 580), (900, 665), (785, 680),
+            (795, 1235), (705, 1330), (795, 1520), (705, 1855), (605, 1935), (555, 1935), (435, 1690),
+            (515, 1600), (515, 1300), (395, 1220), (395, 830), (495, 690), (270, 670), (270, 580),
+            (470, 565), (395, 330), (470, 155)]
+    keep = np.zeros(g.shape, np.uint8)
+    cv2.fillPoly(keep, [np.array(hull, np.int32)], 1)
+    keep = cv2.GaussianBlur(keep.astype(np.float32), (0, 0), 6)
+    ink = ink * np.clip(keep * 1.5, 0, 1)
+    sil = np.zeros(g.shape, np.uint8)
+    cv2.fillPoly(sil, [np.array([(548, 148), (614, 148), (618, 595), (544, 595)], np.int32)], 1)   # grip, pommel
+    cv2.fillPoly(sil, [np.array([(284, 596), (886, 596), (886, 648), (284, 648)], np.int32)], 1)   # guard
+    cv2.fillPoly(sil, [np.array([(524, 648), (652, 648), (642, 1300), (586, 1912), (530, 1300)], np.int32)], 1)  # blade
+    sil = cv2.GaussianBlur(sil.astype(np.float32), (0, 0), 1.5)
+    axis, half = 585, 330
+    ink, sil = ink[40:1945, axis - half:axis + half], sil[40:1945, axis - half:axis + half]
+    ink, sil = np.rot90(ink, 1), np.rot90(sil, 1)                        # point (bottom) -> right
+    ink = fit(np.ascontiguousarray(ink), width=SWORD_LEN)
+    sil = fit(np.ascontiguousarray(sil), width=SWORD_LEN)
+    return np.clip(ink, 0, 1), np.clip(sil, 0, 1)
+
+
 def rose_sprite():
     """The front-facing rose from rose-sword.png: ink outline, red petal fill, silhouette."""
     rs = ink_from(os.path.join(REF, 'rose-sword.png'), lo=0.1, hi=0.78)
@@ -693,7 +724,7 @@ class Slash:
         jag2 = np.interp(s, np.arange(-1200, 1200, 37), rng.normal(0, 1.4, len(range(-1200, 1200, 37))))
         self.d = d + jag1 + jag2
         self.s = s
-        self.sword = rapier_sprite()
+        self.sword, self.sword_sil = sword_sprite()
         self.sword_field = rank_noise(self.sword.shape, 5, 90)
         self.sword_stain = cv2.GaussianBlur(self.sword, (0, 0), 6) * 0.5
         self.rose_ink, self.rose_red, self.rose_sil = rose_sprite()
@@ -742,10 +773,12 @@ class Slash:
     # -- the rapier ----------------------------------------------------------------------------
     def tip_pose(self, t):
         """Point position and pointing direction (unit) of the rapier, or None when not shown."""
-        hover_tip = np.array([1700.0, 372.0])
-        hover_dir = np.array([-0.46, 0.89])
-        wind_tip = np.array([1765.0, 296.0])
-        wind_dir = np.array([-0.28, 0.96])
+        # it appears floating above the right half of the word, point to the left; winds up by
+        # drawing back to the right and raising its point; then drops onto the cut line
+        hover_tip = np.array([1150.0, 300.0])
+        hover_dir = np.array([-0.97, 0.24]); hover_dir /= np.linalg.norm(hover_dir)
+        wind_tip = np.array([1560.0, 225.0])
+        wind_dir = np.array([-0.92, -0.39]); wind_dir /= np.linalg.norm(wind_dir)
         if t < T_SWORD_IN[0]:
             return None
         if t >= T_RETURN[0]:
@@ -766,15 +799,15 @@ class Slash:
             return hover_tip + (wind_tip - hover_tip) * u, dvec / np.linalg.norm(dvec)
         if t < T_CUT[0]:
             u = span(t, *T_SWOOP) ** 1.6
-            P = [wind_tip, (1795, 470), (1880, cut_y(1880)), (X_ENTER, cut_y(X_ENTER))]
-            p = bezier(P, u)
-            q = bezier(P, min(1.0, u + 0.02)) - bezier(P, max(0.0, u - 0.02))
-            return p, q / (np.linalg.norm(q) + 1e-9)
+            P = [wind_tip, (1700, 290), (1790, cut_y(1790) - 45), (X_ENTER, cut_y(X_ENTER))]
+            a0 = np.arctan2(-wind_dir[1], wind_dir[0]); a1 = np.arctan2(CUT_U[1], -CUT_U[0])
+            a = a0 + (a1 - a0) * smooth(u)
+            return bezier(P, u), np.array([np.cos(a), -np.sin(a)])
         u = span(t, *T_CUT)
         x = X_ENTER + (X_EXIT - X_ENTER) * u
         return np.array([x, cut_y(x)]), -CUT_U
 
-    def draw_sword(self, t, fps, ink):
+    def draw_sword(self, t, fps, ink, clear=None):
         """Adds the rapier's coverage to `ink` (full page). Motion blur: many sub-frames across
         the frame's shutter, each warped only into the box the blade occupies."""
         if T_SWOOP[0] <= t <= T_CUT[1] + 0.02:
@@ -787,10 +820,14 @@ class Slash:
         if t < T_WINDUP[0]:
             p = span(t, *T_SWORD_IN)
             q = np.clip((p * 1.4 - self.sword_field) / 0.4, 0, 1)
-            spr = (self.sword_stain * (1 - q) + self.sword * q) * np.clip(p * 2.5, 0, 1)
+            fade = np.clip(p * 2.5, 0, 1)
+            spr = (self.sword_stain * (1 - q) + self.sword * q) * fade
+            sil = self.sword_sil * smooth(p * 1.4 - 0.3)
         else:
             spr = self.sword
+            sil = self.sword_sil
         acc = np.zeros((H, W), np.float32)
+        acc_s = np.zeros((H, W), np.float32)
         corners = np.array([[0, 0, 1], [sw_, 0, 1], [0, sh, 1], [sw_, sh, 1]], np.float64)
         drawn = 0
         for k in range(n):
@@ -811,8 +848,11 @@ class Slash:
                 continue
             M[0, 2] -= x0; M[1, 2] -= y0
             acc[y0:y1, x0:x1] += cv2.warpAffine(spr, M, (x1 - x0, y1 - y0), flags=cv2.INTER_LINEAR)
+            acc_s[y0:y1, x0:x1] += cv2.warpAffine(sil, M, (x1 - x0, y1 - y0), flags=cv2.INTER_LINEAR)
         if drawn:
             np.maximum(ink, np.clip(acc / n, 0, 1), out=ink)
+            if clear is not None:
+                np.maximum(clear, np.clip(acc_s / n, 0, 1), out=clear)
 
     # -- the cut, the blood ------------------------------------------------------------------
     def sep(self, t):
@@ -1134,7 +1174,8 @@ class Film:
         rose_red = np.zeros((H, W), np.float32)
         sl.draw_roses(t, deco, rose_red, halo)
         sword = np.zeros((H, W), np.float32)
-        sl.draw_sword(t, self.fps, sword)
+        sword_clear = np.zeros((H, W), np.float32)
+        sl.draw_sword(t, self.fps, sword, sword_clear)
 
         # breathing grain: three fixed textures cross-faded slowly (no per-frame noise crawl)
         ph = t * 0.6
@@ -1169,6 +1210,8 @@ class Film:
             smear, core = tr
             lay_over(smear, PRINT)
             P *= (1 - core[..., None]); A *= (1 - core)
+        # the sword's body hides what it passes over (paper under its lines)
+        P *= (1 - sword_clear[..., None]); A *= (1 - sword_clear)
         lay_over(sword, PRINT)
         rgb = P / np.maximum(A, 1e-6)[..., None]
         if self.cat is not None:
