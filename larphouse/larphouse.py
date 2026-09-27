@@ -606,7 +606,15 @@ X_ENTER, X_END = 2060.0, 105.0   # tip x when entering (just off screen) and whe
 CUT_EASE = 2.4                   # ease-out power: very fast at first, braking through the L
 T_SWORD_IN = (T_CUT[0], T_CUT[0])
 T_SWOOP = T_SWORD_IN
-T_RETURN = (3.46, 4.4)
+# after the cut: the blade trembles where it stopped, is tossed up in an arc towards the middle,
+# turning over about its balance point (a turn and a quarter, slowing into the top of the arc,
+# point down), drops point first and sticks in the gap between p and h with a shudder
+T_TREMBLE = (3.46, 3.6)
+T_TOSS = (3.6, 4.08)
+T_DROP = (4.08, 4.2)
+T_IMPACT = T_DROP[1]
+T_RETURN = (T_TREMBLE[0], T_IMPACT)
+BALANCE = 500.0              # tip to balance point (just below the guard), px
 T_VINES = (3.0, 5.7)         # the vine on the sword grows out along its stems from the moment it enters
 T_VINE_PINK = (4.6, 6.35)    # its flowers and leaves flush pink
 PLANT_X = 1001.5             # the gap between "p" and "h"
@@ -791,18 +799,62 @@ class Slash:
         if t < T_CUT[0]:
             return None
         if t >= T_RETURN[0]:
-            # from rest just past the L: rises and swings right, the point turning from left to
-            # down, and comes down into the gap between p and h with a small settling bounce
-            u = span(t, *T_RETURN)
-            e = ease_out_back(u, 0.8)
-            y0 = cut_y(X_END)
-            P = [(X_END, y0), (X_END - 60, y0 - 330), (PLANT_X - 40, REST_TIP[1] - 520), tuple(REST_TIP)]
-            p = bezier(P, min(1.0, e)) if e <= 1 else REST_TIP + (REST_TIP - bezier(P, 2 - e)) * 0.35
-            a0 = np.arctan2(CUT_U[1], -CUT_U[0])           # pointing left along the cut
-            a = a0 + (np.radians(-90.0) - a0) * e          # left -> down, through down-left (-175 -> -90 deg)
-            return p, np.array([np.cos(a), -np.sin(a)])
+            return self.after_cut(t)
         x = X_ENTER + (X_END - X_ENTER) * cut_progress(t)
         return np.array([x, cut_y(x)]), -CUT_U
+
+    def after_cut(self, t):
+        """Tremble, toss, drop and stick. Rotations are about the balance point (and about the
+        planted tip once it sticks), so the sword turns like a real one instead of sweeping round
+        its point."""
+        def pose(c, a):
+            d = np.array([np.cos(a), -np.sin(a)])
+            return c + d * BALANCE, d
+
+        a0 = np.arctan2(CUT_U[1], -CUT_U[0])                # pointing left along the cut (-175 deg)
+        tip0 = np.array([X_END, cut_y(X_END)])
+        d0 = np.array([np.cos(a0), -np.sin(a0)])
+        c0 = tip0 - d0 * BALANCE
+        a_down = np.radians(-90.0)
+        a_end = a_down - 2 * np.pi                          # over the top: a turn and a quarter
+        c_end = REST_TIP - np.array([0.0, BALANCE])
+        apex = c_end - np.array([0.0, 140.0])
+        if t < T_TREMBLE[1]:
+            # the blade still humming from the stop: a fast decaying quiver about the balance point
+            w = t - T_TREMBLE[0]
+            q = np.radians(1.8) * np.exp(-w / 0.05) * np.sin(2 * np.pi * 22 * w)
+            return pose(c0, a0 + q)
+        if t < T_TOSS[1]:
+            u = span(t, *T_TOSS)
+            e = 1 - (1 - u) ** 2.4                          # thrown hard, hangs at the top
+            P = [c0, (c0[0] + 60, c0[1] - 420), (apex[0] - 160, apex[1] - 90), tuple(apex)]
+            er = 1 - (1 - u) ** 2.0                         # the spin slows into the top too
+            return pose(bezier(P, e), a0 + (a_end - a0) * er)
+        if t < T_DROP[1]:
+            u = span(t, *T_DROP) ** 2                       # falls, accelerating
+            return pose(apex + (c_end - apex) * u, a_end)
+        # stuck: the hilt shudders about the planted point
+        w = t - T_IMPACT
+        q = np.radians(1.6) * np.exp(-w / 0.16) * np.sin(2 * np.pi * 7.0 * w)
+        a = a_end + q
+        d = np.array([np.cos(a), -np.sin(a)])
+        return REST_TIP.copy(), d
+
+    def impact_flecks(self, t, ink):
+        """Ink knocked out of p and h where the blade goes in (uint8)."""
+        u = t - T_IMPACT
+        if u < 0 or u > 0.8:
+            return
+        rng = np.random.default_rng(77)
+        for k in range(14):
+            x0 = PLANT_X + rng.uniform(-14, 14)
+            y0 = rng.uniform(450, 560)
+            vx = rng.choice([-1, 1]) * rng.uniform(120, 420)
+            vy = -rng.uniform(80, 380)
+            px, py = x0 + vx * u, y0 + vy * u + 1100 * u * u
+            r = rng.uniform(1.2, 3.0) * (1 - u / 0.8)
+            if r > 0.4:
+                cv2.circle(ink, (int(px * 16), int(py * 16)), int(r * 16), 255, -1, cv2.LINE_AA, 4)
 
     def split_vines(self, full):
         """Separate the vine from the bare sword: everything outside the blade/guard/grip
@@ -864,15 +916,16 @@ class Slash:
     def draw_sword(self, t, fps, ink, clear=None, pink_out=None):
         """Adds the rapier's coverage to `ink` (full page). Motion blur: many sub-frames across
         the frame's shutter, each warped only into the box the blade occupies."""
-        if T_CUT[0] - 0.12 <= t <= T_CUT[1] + 0.02:
-            n = 48                                       # the blow: the blade is a streak
-        elif T_RETURN[0] <= t <= T_RETURN[1] - 0.15:
-            n = 24                                       # the swing back
-        else:
-            n = 1
+        # motion blur only as much as the sword actually moves within the frame: how far the
+        # point and the pommel travel over one frame, one sub-frame per ~3 px
+        n = 1
+        pa, pb = self.tip_pose(t - 0.5 / fps), self.tip_pose(t + 0.5 / fps)
+        if pa is not None and pb is not None:
+            ends = lambda p: (p[0], p[0] - p[1] * SWORD_LEN)
+            (ta, ha), (tb, hb) = ends(pa), ends(pb)
+            move = max(np.linalg.norm(tb - ta), np.linalg.norm(hb - ha))
+            n = int(np.clip(move / 3.0, 1, 48))
         sh, sw_ = self.sword.shape
-        if T_SWORD_IN[0] <= t < T_CUT[0] - 0.12:
-            n = max(n, 16)                               # flying in: motion blur
         spr = self.sword
         sil = self.sword_sil
         vink, vpink = self.vine_sprites(t)               # the vine rides along, blur and all
@@ -1118,11 +1171,16 @@ class Slash:
         return smear.astype(np.float32), core.astype(np.float32)
 
     def shake(self, t):
+        dx = dy = 0.0
         u = (t - T_CUT[0]) / T_SHAKE
-        if u < 0 or u > 1:
-            return 0.0, 0.0
-        a = 7.0 * (1 - u) ** 2
-        return a * np.sin(2 * np.pi * 23 * u), a * 0.6 * np.cos(2 * np.pi * 17 * u + 0.7)
+        if 0 <= u <= 1:
+            a = 7.0 * (1 - u) ** 2
+            dx += a * np.sin(2 * np.pi * 23 * u); dy += a * 0.6 * np.cos(2 * np.pi * 17 * u + 0.7)
+        u = (t - T_IMPACT) / 0.22                        # the sword sticks: a short jolt, mostly down
+        if 0 <= u <= 1:
+            a = 3.5 * (1 - u) ** 2
+            dx += a * 0.4 * np.sin(2 * np.pi * 19 * u); dy += a * np.cos(2 * np.pi * 14 * u)
+        return dx, dy
 
     def chips(self, t, ink):
         """Flecks of ink knocked out of the cut, flying the way of the blow and falling (uint8)."""
@@ -1222,6 +1280,7 @@ class Film:
         np.maximum(ink, title, out=ink)
         chips = np.zeros((H, W), np.uint8)
         sl.chips(t, chips)
+        sl.impact_flecks(t, chips)
         np.maximum(ink, chips.astype(np.float32) / 255, out=ink)
         deco8 = np.zeros((H, W), np.uint8)
         halo8 = np.zeros((H, W), np.uint8)
