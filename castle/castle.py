@@ -32,6 +32,7 @@ PUSH = (0.0, 12.0, 1.045)                 # slow push in on the castle
 ZOOM_C = (1075.0, 420.0)
 
 WARM = np.array([1.0, 0.72, 0.42], np.float32)
+NIGHT = 0.27                              # exposure of the night grade
 BOLT_COL = np.array([0.93, 0.95, 1.0], np.float32)
 
 
@@ -141,7 +142,7 @@ class Raven:
         if ys.stop <= ys.start or xs.stop <= xs.start:
             return
         sub = box[ys.start - y0:ys.stop - y0, xs.start - x0:xs.stop - x0]
-        np.maximum(dst[ys, xs], sub * alpha, out=dst[ys, xs])
+        dst[ys, xs] += sub * alpha
 
 
 def path_pose(P, u):
@@ -152,16 +153,34 @@ def path_pose(P, u):
 
 # (start, end, path control points, scale, beats per second, phase, layer)
 # layer "near" is drawn over the fog, "far" under it
-FLIGHTS = [
-    dict(t=(3.0, 5.7), P=[(2150, 560), (1500, 470), (700, 520), (-260, 400)], scale=0.62, f=3.0, ph=0.1, layer='near'),
-    dict(t=(3.35, 6.6), P=[(2080, 250), (1180, 110), (900, 420), (-180, 170)], scale=0.3, f=3.6, ph=0.55, layer='near'),
-    dict(t=(3.9, 6.9), P=[(2020, 430), (1500, 360), (800, 400), (-120, 320)], scale=0.17, f=4.2, ph=0.3, layer='far'),
-    # the second bolt scares ravens off the towers
-    dict(t=(8.55, 10.6), P=[(1066, 300), (1150, 150), (1500, 60), (2050, -80)], scale=0.13, f=5.0, ph=0.0, layer='far'),
-    dict(t=(8.6, 10.9), P=[(1180, 400), (1320, 300), (1700, 280), (2060, 150)], scale=0.11, f=5.4, ph=0.4, layer='far'),
-    dict(t=(8.62, 10.5), P=[(930, 360), (820, 220), (500, 120), (-120, 60)], scale=0.14, f=4.8, ph=0.7, layer='far'),
-    dict(t=(8.7, 11.2), P=[(1010, 330), (960, 170), (700, 40), (300, -120)], scale=0.1, f=5.6, ph=0.2, layer='far'),
-]
+def make_flights():
+    """A loose flock crossing high over the castle, right to left, and a second flock bursting
+    off the towers when the near bolt strikes. Small birds, seeded."""
+    rng = np.random.default_rng(42)
+    fl = []
+    for k in range(16):                                   # the crossing flock
+        t0 = 2.6 + k * 0.2 + rng.uniform(-0.12, 0.12)
+        dur = rng.uniform(3.6, 5.0)
+        y0 = rng.uniform(70, 300)
+        y1 = y0 + rng.uniform(-110, 60)
+        sag = rng.uniform(-70, 50)
+        P = [(2040 + rng.uniform(0, 120), y0), (1400, y0 + sag), (600, y1 + sag * 0.6), (-140, y1)]
+        fl.append(dict(t=(t0, t0 + dur), P=P, scale=rng.uniform(0.055, 0.12), f=rng.uniform(3.4, 5.2),
+                       ph=rng.uniform(0, 1), layer='near'))
+    towers = [(1066, 300), (1000, 330), (1180, 400), (930, 360), (840, 450), (1210, 360), (1066, 330)]
+    for k in range(12):                                   # scared off the towers by the bolt
+        sx, sy = towers[k % len(towers)]
+        t0 = 8.55 + rng.uniform(0, 0.35)
+        ang = rng.uniform(np.radians(200), np.radians(340))   # upward, either side
+        L = rng.uniform(900, 1400)
+        ex, ey = sx + np.cos(ang) * L, sy + np.sin(ang) * L * 0.55
+        P = [(sx, sy), (sx + np.cos(ang) * 120, sy - 140), ((sx + ex) / 2, min(sy, ey) - 60), (ex, ey)]
+        fl.append(dict(t=(t0, t0 + rng.uniform(2.0, 2.8)), P=P, scale=rng.uniform(0.045, 0.085),
+                       f=rng.uniform(5.0, 6.5), ph=rng.uniform(0, 1), layer='far'))
+    return fl
+
+
+FLIGHTS = make_flights()
 
 
 # ---------------------------------------------------------------- lightning
@@ -243,7 +262,7 @@ class Film:
                                        (0, 0), 0.9) for k in range(3)]
         self.grain = [g / g.std() for g in self.grain]
         yy, xx = np.mgrid[0:H, 0:W].astype(np.float32)
-        self.vignette = 1 - 0.28 * (((xx - W / 2) / (W * 0.7)) ** 2 + ((yy - H / 2) / (H * 0.75)) ** 2) ** 1.2
+        self.vignette = 1 - 0.45 * (((xx - W / 2) / (W * 0.7)) ** 2 + ((yy - H / 2) / (H * 0.75)) ** 2) ** 1.2
         self.win = np.exp(-(((xx - 926 * W / 1672) / 3.2) ** 2 + ((yy - 318 * H / 940) / 4.5) ** 2))
         self.win_glow = np.exp(-(((xx - 926 * W / 1672) / 16) ** 2 + ((yy - 318 * H / 940) / 18) ** 2))
 
@@ -281,9 +300,8 @@ class Film:
                 p, head = path_pose(fl['P'], u)
                 bob = 5 * fl['scale'] * np.sin(2 * np.pi * 0.9 * ts + k)
                 flip = np.cos(head) < 0
-                tmp = np.zeros((H, W), np.float32)
-                self.raven.draw(tmp, p[0], p[1] + bob, fl['scale'], head, fl['ph'] + fl['f'] * (ts - a), flip=flip)
-                cov += tmp / n
+                self.raven.draw(cov, p[0], p[1] + bob, fl['scale'], head, fl['ph'] + fl['f'] * (ts - a),
+                                alpha=1.0 / n, flip=flip)
         return np.clip(cov, 0, 1)
 
     def flash(self, t):
@@ -305,7 +323,7 @@ class Film:
         rgb = np.repeat(plate[..., None], 3, 2)
         # far ravens: in front of the castle, behind the fog
         far = self.ravens(t, 'far', fps)
-        rgb = rgb * (1 - far[..., None]) + 0.04 * far[..., None]
+        rgb = rgb * (1 - far[..., None]) + 0.02 * far[..., None]
         # bolts: behind the castle and the trees, softened by the fog in front
         fog_a, tone = self.fog(t)
         for b, (core, glow) in zip(BOLTS, self.bolts):
@@ -317,14 +335,16 @@ class Film:
             rgb = rgb * (1 - k) + BOLT_COL * k
         # fog
         rgb = rgb * (1 - fog_a[..., None]) + (tone * fog_a)[..., None]
-        # the storm comes: everything darkens
-        dk = 1 - 0.5 * smooth(span(t, *T_DARKEN))
+        # night: almost black, the sky a shade lighter than the castle so it only just shows
+        rgb = NIGHT * np.power(np.clip(rgb, 0, 1), 1.9)
+        # the storm comes: darker still
+        dk = 1 - 0.4 * smooth(span(t, *T_DARKEN))
         rgb = rgb * dk
         # lightning lights the sky and the fog; the castle stays a black silhouette
         f = self.flash(t)
         if f > 0:
             lit = np.clip(light * (1 - fog_a) + fog_a * 0.9, 0, 1)
-            rgb = rgb + f * (0.95 - rgb) * lit[..., None] * 0.9
+            rgb = rgb + f * (0.8 - rgb) * lit[..., None] * 0.9
         for b, (core, glow) in zip(BOLTS, self.bolts):
             e = flash_env(t, b['t']) * b['strength']
             if e > 0.05:
@@ -338,7 +358,7 @@ class Film:
             rgb = rgb + (WARM * (g * wl * flick)[..., None])
         # near ravens over everything
         near = self.ravens(t, 'near', fps)
-        rgb = rgb * (1 - near[..., None]) + 0.03 * near[..., None]
+        rgb = rgb * (1 - near[..., None]) + 0.01 * near[..., None]
         # rain
         ra = smooth(span(t, *T_RAIN))
         if ra > 0:
@@ -353,12 +373,12 @@ class Film:
                 cv2.line(lay, (int(xi * 16), int(yi * 16)),
                          (int((xi + slant * Li) * 16), int((yi - Li) * 16)), min(255, c), 1, cv2.LINE_AA, 4)
             rl = lay.astype(np.float32)[..., None] / 255
-            rgb = rgb + (0.85 - rgb) * rl
+            rgb = rgb + (0.42 + 0.4 * f - rgb) * rl
         # grain and vignette
         ph = t * 7.0
         wts = [0.5 + 0.5 * np.cos(2 * np.pi * (ph - j / 3)) for j in range(3)]
         gr = sum(w_ * g_ for w_, g_ in zip(wts, self.grain)) / sum(wts)
-        rgb = rgb * self.vignette[..., None] + 0.018 * gr[..., None]
+        rgb = rgb * self.vignette[..., None] + 0.008 * gr[..., None]
         return (np.clip(rgb, 0, 1) * 255 + 0.5).astype(np.uint8)
 
 
